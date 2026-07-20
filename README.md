@@ -7,13 +7,20 @@ are its properties, where is it used") by graph lookup instead of expensive text
 
 ## Status
 
-Research phase. See [`INITIAL_RESEARCH.md`](./INITIAL_RESEARCH.md) for the findings,
-evidence, and recommended build path.
+Planning complete; Phase 0 next. Docs:
+- [`INITIAL_RESEARCH.md`](./INITIAL_RESEARCH.md) — evidence: tokens vs correctness, prior art.
+- [`INTEGRATION_CONSTRAINTS.md`](./INTEGRATION_CONSTRAINTS.md) — building into Claude Code; decisions + problem map.
+- [`EVAL.md`](./EVAL.md) — how we measure whether it actually helps (from day one).
+- [`PLAN.md`](./PLAN.md) — architecture + phased build sequence.
 
-## Direction (from research)
+## Direction (settled)
 
-- Deterministic **AST/LSP-derived typed symbol graph** — best evidence for *both* fewer
-  tokens and higher correctness.
-- Start with **LSP-as-tools**, add **tree-sitter + PageRank repo-map**, persist a
-  SQLite/Kùzu graph only when repo-wide queries outgrow LSP.
-- Vector/semantic search stays at the **fuzzy discovery edge**, never the correctness core.
+- **LSP-backed** deterministic typed symbol graph — correctness first (users install the LSP).
+- Ships as a **portable MCP daemon** (works in any MCP harness) + a thin **Claude Code
+  adapter** (hooks + CLAUDE.md). Claude Code first.
+- **Staleness is the hard problem:** a blocking `PostToolUse` hook is a deterministic sync
+  barrier; freshness metadata + model instruction back it up.
+- **Never deny grep** — a search-strategy doc (always in context) teaches graph-vs-grep.
+- **Eval rig from day one:** retrieval correctness (CI gate) + end-to-end task capability
+  (SWE-bench Verified / FeatureBench / SmellBench, two-arm delta, stratified by nav spread).
+- Windows ↔ WSL path handling as a first-class differentiator.
