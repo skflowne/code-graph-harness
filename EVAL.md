@@ -1,87 +1,89 @@
-# EVAL — How we measure whether the graph actually helps
+# EVAL — How we measure whether the graph actually helps (budget-shaped)
 
 **Date:** 2026-07-21
 **Principle:** Retrieval correctness (did `find_references` return the right lines) is
 **necessary but not sufficient**. The real question is whether the model **ships better
-features, fixes, and refactors** — cheaper — *with* the graph than without. Everything else
-is a proxy. The eval rig exists **from day one**; it is the only way to know if we help.
+features, fixes, and refactors** — cheaper — *with* the graph than without. The eval rig
+exists **from day one**; it is the only way to know if we help.
+
+**Budget reality:** No budget for large benchmark sweeps. The real currency is **Claude Max
+quota** — headless `claude -p` eval runs consume the same weekly limits as real work, so a
+big suite would block the user's actual coding. The eval is therefore **quota-boxed**: the
+free/cheap tiers carry the day-to-day signal, and the expensive model-in-the-loop tier is a
+**tiny, curated, milestone-only** run. Default eval model = **Sonnet** (cheaper/faster);
+**Opus** only for occasional final validation.
 
 ---
 
-## Two tiers
+## Three tiers, cheapest-first
 
-### Tier A — Retrieval correctness (component)  · CI gate, every commit
-- **What:** gold `definition` / `references` / `type` / `members` locations on pinned repos.
-- **Ground truth:** bootstrapped from the LSP on a frozen commit, spot-checked, then frozen.
-- **Metrics:** precision / recall / exactness of returned locations.
-- **Stale-correctness (critical):** scripted edit sequences assert the graph returns correct
-  **post-edit** locations — this is the regression gate for the staleness barrier (§barrier).
-- **Role:** guards the machinery. Fast, deterministic, blocks merges. Not the scoreboard.
+### Tier A — Retrieval correctness (no LLM)  · FREE · CI gate, every commit
+- Gold `definition`/`references`/`type`/`members` locations on pinned TS repos.
+- Ground truth bootstrapped from the language provider on a frozen commit, spot-checked,
+  frozen.
+- Metrics: precision / recall / exactness of returned locations.
+- **Stale-correctness (critical):** scripted edit sequences assert correct **post-edit**
+  locations — the regression gate for the staleness barrier.
+- **Role:** deterministic, no model calls, runs on every commit. This carries the load.
 
-### Tier B — Task capability (the thesis test)  · periodic (nightly / pre-release)
-Does the model resolve real production tasks better/cheaper with the graph?
+### Tier B — Navigation efficiency (LLM, short episodes)  · CHEAP · per-milestone
+The affordable thesis signal. Instead of solving whole GitHub issues, ask **fixed questions
+with known-correct answers** and measure **cost-to-correct-answer**.
+- Question set (~20–40): "where is X defined", "what implements interface Y", "list callers
+  of Z", "what's the type of expr at file:line", "what breaks if I change W" — each with a
+  pre-verified answer.
+- Two arms (graph-on vs off), same model, on 2–3 mid-size TS repos.
+- **Metrics:** correct? (binary) · **tokens-to-answer** · tool calls · turns.
+- Short episodes = cheap → can run every milestone on Sonnet. This directly measures the
+  token-reduction thesis without the cost of full task resolution.
 
-**Task sources — reuse OSS-harvested benchmarks with execution oracles (no hand-authoring):**
-
-| Category | Source | Oracle | Notes |
-|---|---|---|---|
-| Bugs | **SWE-bench Verified** (500, Python) | `FAIL_TO_PASS` + `PASS_TO_PASS` tests | Aligns with pyright-first |
-| Features | **FeatureBench** (ICLR 2026) | execution-based, test-driven | Beyond bug fixing |
-| Refactors | **SmellBench** / refactor-labeled PRs | existing tests still pass (+structural) | Multi-file → graph should shine |
-| Contamination check | **SWE-bench Live** (rolling, post-cutoff) | test execution | Confirms delta holds on fresh tasks |
-| Multilingual (later) | **SWE-bench Multilingual / Multi-SWE-bench** | test execution | TS/Rust/Go as LSPs are added |
-
-**Two-arm design — everything identical except the graph:**
-- **Baseline:** vanilla Claude Code headless (`claude -p`, grep/read, `--strict-mcp-config`
-  → no graph).
-- **Treatment:** same + our MCP server + hooks + search-strategy CLAUDE.md.
-- Identical: model, base commit, prompt, turn/token caps.
-- **N ≥ 3–4 runs / task / arm** (nondeterminism), report median / rate, **paired by task**.
-
-**Metrics per task:**
-- *Capability (primary):* resolved — pass@1, pass@k.
-- *Efficiency (primary):* total tokens, cost, tool calls, turns.
-- *Diagnostic:* graph-tool adoption count, stale-rate encountered, wall-clock.
+### Tier C — Task capability (LLM, long episodes)  · EXPENSIVE · milestone-only, tiny
+The gold standard: does the model resolve real production tasks better/cheaper?
+- **Tiny curated set (~10–20 TS tasks)**, sourced from real merged PRs with test oracles,
+  stratified by navigation spread (see below). Not hundreds.
+- Sources: **Multi-SWE-bench / SWE-bench Multilingual (TS/JS subset)** for free oracles +
+  a small hand-curated supplement of large-repo, multi-file tasks (to stress graph strength
+  and control spread). *(Verify exact TS instance counts at Phase 2.)*
+- Oracle: `FAIL_TO_PASS` + `PASS_TO_PASS` test execution.
+- **N = 1–2 runs/task/arm** (accept noise; pairing reduces variance), paired by task.
+- **Metrics:** resolved (pass@1) · tokens · tool calls · turns.
+- Run **manually at major milestones**, Sonnet default, Opus spot-check on a handful.
+  Quota budget: a few dozen episodes per milestone, scheduled when not doing real work.
 
 ---
 
 ## Two methodological commitments that keep it honest
 
 1. **Within-task delta cancels confounders.** Both arms run the same harness on the same
-   inputs, so contamination and scaffolding effects (which swing SWE-bench 10–20 pts on
-   their own) largely cancel. Our absolute numbers are **not** leaderboard-comparable — only
-   our **deltas** are, and the delta is exactly what isolates the graph's contribution.
+   inputs, so contamination and scaffolding effects (which swing SWE-bench 10–20 pts alone)
+   largely cancel. Absolute numbers are **not** leaderboard-comparable — only our **deltas**
+   are, and the delta isolates the graph. This is also what lets small N stay meaningful.
 
-2. **Stratify by "navigation spread."** Bin tasks by how cross-file / multi-hop the gold
-   solution is (files changed in gold patch, distinct symbols referenced, cross-file ref
-   count). Hypothesis (from `INITIAL_RESEARCH.md`): the graph's advantage **grows with
-   spread** and is ~zero on single-file localized tasks (the OkHttp-13% case). Report the
-   delta **as a curve over spread**, not one aggregate — this turns a likely-null average
-   into the real signal, and pre-commits us to accepting an honest result.
+2. **Stratify by "navigation spread."** Bin tasks/questions by how cross-file / multi-hop
+   the answer is (files touched, distinct symbols, cross-file refs). Hypothesis (from
+   `INITIAL_RESEARCH.md`): the graph's advantage **grows with spread** and is ~zero on
+   single-file localized cases (the OkHttp-13% case). Report the delta **as a curve over
+   spread**, not one aggregate — with a tiny N this is what turns noise into signal, and
+   pre-commits us to an honest read.
 
 **Pre-registered success bar (no goalpost-moving):** primary success = **no worse
-resolution at materially fewer tokens/tool-calls, with resolution improving on high-spread
-tasks.** Higher overall resolution is a bonus, not the bar. A null aggregate with a positive
-high-spread slope is a *valid, publishable* outcome. So is a negative result — we ship the
-truth.
+resolution at materially fewer tokens/tool-calls, with the advantage concentrated on
+high-spread tasks.** A null aggregate with a positive high-spread slope is a valid outcome.
+So is a negative result — we ship the truth.
 
 ---
 
 ## The eval runs the real system
-
-Tier B executes the **full daemon + hooks + LSP + staleness barrier**, freshly indexed at
-each task's base commit, with edits live as the model works. Not a mocked graph. So Tier B
-doubles as an **integration test for the staleness barrier under realistic edit sequences**.
-
----
+Tiers B and C execute the **full daemon + hooks + language provider + staleness barrier**,
+freshly indexed at each base commit, edits live. Not a mocked graph → Tier C doubles as an
+integration test for the barrier under realistic edit sequences.
 
 ## Statistics
-- Paired per-task deltas; bootstrap CIs on resolution-rate delta and token delta.
-- Report per-stratum (spread bins) **and** aggregate.
-- Willing to report/accept null or negative results.
+Paired per-item deltas; bootstrap CIs where N allows; report **per spread-bin** and
+aggregate. With small N, lean on Tier A (free, large) for confidence in the machinery and
+Tier B (cheap, repeatable) for the efficiency trend; treat Tier C as directional.
 
-## Open items to define during Phase 2
-- Exact spread-binning thresholds (compute from gold patches; calibrate on a pilot set).
-- Task subset sizes per source (statistical power vs cost of N×2×tasks headless runs).
-- How much curated large-repo / multi-file supplement (to stress graph strength) vs pure
-  harvested sets.
+## Open items (Phase 2)
+- Spread-bin thresholds (compute from gold patches; calibrate on a pilot).
+- Final Tier B question set + Tier C task list (TS sources vs curated).
+- Per-milestone quota budget (episodes/week we can spend without blocking real work).

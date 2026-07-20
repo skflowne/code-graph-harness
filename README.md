@@ -21,6 +21,9 @@ Planning complete; Phase 0 next. Docs:
 - **Staleness is the hard problem:** a blocking `PostToolUse` hook is a deterministic sync
   barrier; freshness metadata + model instruction back it up.
 - **Never deny grep** — a search-strategy doc (always in context) teaches graph-vs-grep.
-- **Eval rig from day one:** retrieval correctness (CI gate) + end-to-end task capability
-  (SWE-bench Verified / FeatureBench / SmellBench, two-arm delta, stratified by nav spread).
+- **TypeScript first:** daemon in TS/Node, first target language TS via the TS Language
+  Service API in-process (polyglot via LSP later).
+- **Budget-shaped eval from day one:** free retrieval-correctness CI gate + cheap
+  navigation-efficiency signal + a tiny milestone-only task-capability set (Max quota is the
+  real budget). Two-arm delta, stratified by nav spread.
 - Windows ↔ WSL path handling as a first-class differentiator.

@@ -6,6 +6,13 @@
 
 ---
 
+## Stack decisions
+- **Daemon implementation:** TypeScript / Node.
+- **First target language:** TypeScript — via the **TS Language Service API in-process**
+  (max precision, no separate LSP process), behind a `LanguageProvider` interface. Other
+  languages implement the same interface via generic LSP clients later.
+- **Eval default model:** Sonnet (cheap iteration); Opus for occasional validation only.
+
 ## Architecture
 
 One long-lived **daemon** = the portable core, with **two client faces on one process**.
@@ -60,14 +67,15 @@ rust-analyzer last (hardest, most explicit indexing).
 ## Phases
 
 ### Phase 0 — Walking skeleton + telemetry spine + Tier A scaffold
-- Daemon: MCP (stdio) + control socket, project-keyed path.
-- **One LSP: pyright** (Python — aligns with SWE-bench Verified).
+- Daemon (TypeScript/Node): MCP (stdio) + control socket, project-keyed path.
+- **First language: TypeScript via the TS Language Service API in-process**, behind a
+  `LanguageProvider` interface (so polyglot-via-LSP is a later drop-in).
 - Tools v0: `find_definition`, `find_references`, `get_outline` (signatures, capped,
   carry `generation` + `stale` fields even if trivially fresh).
 - **Path normalizer (WSL ↔ Windows) from the start.**
 - **Telemetry spine (full stack, per decision #7):** JSONL event stream + OTEL exporter +
   session/`graph_mode` tagging.
-- **Tier A eval scaffold:** retrieval-correctness harness on a pinned Python repo.
+- **Tier A eval scaffold:** retrieval-correctness harness on a pinned TS repo.
 - *Exit:* MCP round-trip works; every call is logged; Tier A green on a pinned repo.
 
 ### Phase 1 — Staleness barrier + freshness + Tier A live
@@ -83,19 +91,20 @@ rust-analyzer last (hardest, most explicit indexing).
 - CLAUDE.md **search-strategy** (when graph vs grep, stale-flag protocol) + strong tool
   descriptions.
 - `SessionStart` hook: inject PageRank repo-map (≤10k chars) + graph status.
-- **Tier B runner:** two-arm (graph-on vs off), SWE-bench Verified subset, headless, N runs,
-  **stratified by navigation spread**, paired stats. → first real graph-vs-baseline number.
+- **Tier B (navigation efficiency):** cheap fixed-question set, two-arm, Sonnet, stratified
+  by spread → first affordable graph-vs-baseline signal (tokens-to-answer). See `EVAL.md`.
 - **Full observability:** OTEL token join by session_id + live dashboard.
-- *Exit:* reproducible token + resolution delta with CIs, sliced by spread.
+- *Exit:* reproducible token-to-answer delta, sliced by spread.
 
 ### Phase 3 — Breadth (tools + languages), eval expands
 - Tools: `get_type`, `get_members`, `get_callers`/`get_callees`, `who_imports`/`imports_of`,
   `impact`, `get_source`. Prioritize typed edges (`extends`/`implements`/`type-of`) +
   interface→consumer expansion; bidirectional traversal (per `INITIAL_RESEARCH.md` §4c).
-- Languages via LSP registry: tsserver, gopls, rust-analyzer (install hints, graceful
+- Languages via LSP registry: pyright, gopls, rust-analyzer (install hints, graceful
   degradation on missing servers).
-- Tier B expands: FeatureBench (features), SmellBench/refactors, SWE-bench Multilingual,
-  SWE-bench Live (contamination check).
+- **Tier C (task capability):** tiny curated TS task set (~10–20) from Multi-SWE-bench /
+  SWE-bench Multilingual TS subset + hand-curated multi-file tasks. Milestone-only, Sonnet
+  default, Opus spot-check. See `EVAL.md`.
 
 ### Phase 4 — Hardening & portability
 - Portable-core audit: zero Claude-Code assumptions in the daemon; **second harness adapter
@@ -106,6 +115,6 @@ rust-analyzer last (hardest, most explicit indexing).
 ---
 
 ## Immediate next step
-Phase 0 skeleton: daemon (MCP stdio + control socket) + pyright client + 3 tools + path
-normalizer + JSONL telemetry + Tier A scaffold. Language: TBD (Rust for a distributable
-single binary vs Python/TS for speed of iteration — decide at Phase 0 kickoff).
+Phase 0 skeleton (TypeScript/Node): daemon (MCP stdio + control socket) + TS Language
+Service provider + 3 tools + path normalizer + JSONL telemetry + Tier A scaffold on a
+pinned TS repo.
