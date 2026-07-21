@@ -13,30 +13,46 @@ volume is carried by a **local model** (free — runs on our own compute), and C
 
 ---
 
-## Model axis + the eval runner (how we get free volume)
+## Model × harness axes (how we get free volume + generalization)
 
-Claude Code only runs Claude, so the science runs through a **model-agnostic eval runner we
-own**: an MCP client with a **pluggable backend** — a local OpenAI-compatible endpoint
-(Ollama / vLLM: Qwen3-Coder, GLM, Devstral, …) *or* the Claude API — same scaffolding, same
-prompt, same hooks; only the **model** and the **graph condition** vary.
+We run **two harnesses**, and the **local model is the common thread run in both** — it's
+free, carries the volume, and isolates the harness effect (same model, vary harness × graph).
+The frontier arm is **harness-bound** (Pi can't run Claude):
 
-**Design = 2×2 (at least):** `{local, Claude} × {graph, no-graph}`.
-- **Local arms carry the volume** (free, continuous, no rate limits) → the statistical power.
-- **Claude arms are sparse, quota-boxed** validation.
-- **Ecological-validity check:** occasionally run the `Claude + graph` arm in *real Claude
-  Code* to confirm the neutral-runner result transfers to the shipping product.
+| Harness | Scaffolding | Frontier arm | Local arm (common) |
+|---|---|---|---|
+| **Claude Code** | rich (product context) | Claude (Max-covered) | Qwen3-Coder-30B-A3B (free) |
+| **Pi** | minimal (clean-room control) | OpenAI (pay-$, sparse) | Qwen3-Coder-30B-A3B (free) |
 
-**Hypotheses this tests:**
-- **H1 (main effect):** graph improves each model (local+graph > local−graph; Claude+graph >
-  Claude−graph).
-- **H2 (interaction):** the graph helps the weaker/local model **more** (bigger delta) — our
-  research predicts strong models grep-navigate well and need it less.
-- **H3 (the value story):** does **local+graph approach Claude−graph**? If a free local model
-  *with* the graph rivals ungraphed Claude, that reframes who the tool is for.
+**How each is driven:**
+- **Claude Code:** backend swapped via `ANTHROPIC_BASE_URL` — Claude natively, or the local
+  model (Ollama v0.14+ speaks the Anthropic API natively). Local arms hit localhost → **no Max
+  quota**, full product-harness fidelity. No separate runner needed.
+- **Pi:** minimal harness; frontier = OpenAI (cheap tier / OpenRouter to bound $), plus the
+  local model. Our tools reach Pi via an MCP-adapter package or a native Pi TS extension over
+  the daemon; see `PLAN.md` for the barrier caveat.
 
-**Caveat:** a small local model that underuses the tools tells us about **discoverability**,
-not the graph's ceiling. Log **per-model tool adoption** and read deltas in that light. Also
-pick a local model with competent tool-calling; tool-use ability varies wildly by model.
+**Why two harnesses (Pi's payoff):** Pi adds a second frontier *family* (OpenAI) **and** a
+minimal *harness*, so we can claim the graph **generalizes** — not "helps Claude in Claude
+Code," but "helps frontier + local models across rich and bare-bones harnesses." Pi is the
+low-scaffolding control (recall harness scaffolding swings results 10–20 pts).
+
+**Hypotheses:**
+- **H1 (main effect):** graph improves each (harness, model) cell.
+- **H2 (interaction):** graph helps the weaker/local model **more** — strong models
+  grep-navigate well and need it less.
+- **H3 (value story):** does **local+graph approach frontier−graph** (Claude in CC, OpenAI in
+  Pi)? A free local model + graph rivaling an ungraphed frontier model reframes who this is for.
+- **H4 (generalization):** does the graph delta survive the minimal harness (Pi) and a
+  non-Claude frontier family (OpenAI)?
+
+**Clean vs confounded:** the graph **delta within each (harness, model) cell is always clean**
+— that is the primary result. Cross-cell frontier comparison (Claude-in-CC vs OpenAI-in-Pi)
+mixes harness *and* family → report descriptively, never attribute to harness alone. The
+local-model-in-both runs isolate harness.
+
+**Caveat:** a model that underuses the tools measures **discoverability**, not the graph's
+ceiling. Log **per-(harness,model) tool adoption** and read deltas in that light.
 
 ---
 
@@ -106,16 +122,22 @@ freshly indexed at each base commit, edits live. Not a mocked graph → Tier C d
 integration test for the barrier under realistic edit sequences.
 
 ## Statistics
-Paired per-item deltas; bootstrap CIs where N allows; report **per spread-bin × model**.
-Free local volume gives real power on H1/H2/H3; Claude arms are sparse — treat Claude-side
-CIs as directional and lean on the ecological-validity spot-check. Tier A (free, large)
+Paired per-item deltas; bootstrap CIs where N allows; report **per spread-bin × (harness,
+model) cell**. Free local volume (in both harnesses) gives real power on H1/H2/H4; frontier
+arms (Claude/OpenAI) are sparse → treat their CIs as directional. Tier A (free, large)
 underwrites confidence in the machinery.
 
+## Decisions locked
+- **Local model: Qwen3-Coder-30B-A3B (NVFP4)**, CPU expert-offload (`--n-cpu-moe`) to fit a
+  16 GB RTX 5080 laptop (MoE, 3 B active → stays fast). Pinned for comparability.
+- **Harnesses: Claude Code (rich) + Pi (minimal control).** No separate model-agnostic runner
+  — Claude Code swaps backend via `ANTHROPIC_BASE_URL`; Pi runs its own providers.
+
 ## Open items (Phase 2)
-- **Local model choice** — a coding model with competent tool-calling that fits our hardware
-  (Qwen3-Coder / GLM / Devstral / …); pin it for comparability.
-- **Eval runner** — MCP client + pluggable backend (local OpenAI-compatible / Claude API),
-  approximating Claude Code's loop closely enough for the spot-check to transfer.
+- **Pi adapter** — tool exposure (MCP-adapter package vs native TS extension) and whether a Pi
+  extension can wrap Edit/Write to fire the staleness barrier (else Pi = freshness-metadata +
+  model-instruction only). See `PLAN.md`.
+- **OpenAI arm** — pick a cheap tier / OpenRouter to bound out-of-pocket $; keep sparse.
 - Spread-bin thresholds (compute from gold patches; calibrate on a pilot).
 - Final Tier B question set + Tier C task list (TS sources vs curated).
-- Per-milestone Claude quota budget (episodes/week without blocking real work).
+- Per-milestone frontier budget (Claude Max episodes + OpenAI $) without blocking real work.

@@ -25,8 +25,10 @@ Planning complete; Phase 0 next. Docs:
 - **Staleness is the hard problem:** a blocking `PostToolUse` hook is a deterministic sync
   barrier; freshness metadata + model instruction back it up.
 - **Never deny grep** — a search-strategy doc (always in context) teaches graph-vs-grep.
-- **Budget-shaped eval from day one:** free retrieval-correctness CI gate + a model-agnostic
-  runner where a **local model carries free high-volume runs** and Claude arms are
-  quota-boxed. `{local, Claude} × {graph, no-graph}`, stratified by nav spread — measures the
-  graph's effect *and* whether it helps weaker models more.
+- **Two target harnesses:** Claude Code (rich, product-first) + Pi (minimal, bare-bones eval
+  control). Thin adapters over the portable Go core.
+- **Budget-shaped eval from day one:** free retrieval-correctness CI gate; a **local model
+  (Qwen3-Coder-30B-A3B) carries free high-volume runs in both harnesses** while frontier arms
+  (Claude in Claude Code, OpenAI in Pi) stay sparse. Measures the graph's effect, whether it
+  helps weaker models more, and whether it generalizes across harnesses/model families.
 - Windows ↔ WSL path handling as a first-class differentiator.

@@ -14,8 +14,12 @@
   rust-analyzer) later. **Everything is out-of-process LSP** — the old in-process TS
   Language Service is gone in TS 7 (Corsa dropped the Strada API; programmatic API is IPC,
   WIP until 7.1).
-- **Eval:** model-agnostic runner; local model carries free high-volume runs, Claude arms
-  are quota-boxed validation. See `EVAL.md`.
+- **Target harnesses:** **Claude Code** (rich, product-first) + **Pi** (minimal, bare-bones
+  control) — two thin adapters over the portable Go core. Pi can't run Claude, so its frontier
+  arm is OpenAI. See `EVAL.md`.
+- **Eval:** no separate runner — Claude Code swaps backend via `ANTHROPIC_BASE_URL` (Claude /
+  local via Ollama); Pi runs its own providers. Local model (Qwen3-Coder-30B-A3B) is the free
+  common thread in both.
 
 ### Why Go (over TypeScript / Rust)
 - The hardest, most correctness-critical component — the **staleness barrier + multi-LSP
@@ -159,9 +163,13 @@ Never hang the model. Prototype on tsgo first (TS is target #1), other servers l
   SWE-bench Multilingual TS subset + hand-curated multi-file tasks; `{local, Claude} ×
   {graph, no-graph}`; milestone-only.
 
-### Phase 4 — Hardening & portability
-- Portable-core audit: zero Claude-Code assumptions in the daemon; second harness adapter
-  (Cursor) as proof.
+### Phase 4 — Hardening & second harness adapter (Pi)
+- Portable-core audit: zero Claude-Code assumptions in the daemon.
+- **Pi adapter** (minimal harness, doubles as the eval clean-room): expose graph tools via an
+  MCP-adapter package or a native Pi TS extension over the daemon; inject the repo-map via a Pi
+  Prompt Template/Skill. **Barrier caveat:** Pi has no `PostToolUse` hook — if a Pi extension
+  can wrap Edit/Write, fire the barrier there; else Pi runs on freshness-metadata +
+  model-instruction only (weaker, but a natural experiment on the barrier's value).
 - Perf: LSP warmup, big-repo indexing, coalescing, caching.
 - Dashboard polish; continuous eval in CI.
 
