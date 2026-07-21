@@ -16,14 +16,17 @@ Planning complete; Phase 0 next. Docs:
 ## Direction (settled)
 
 - **LSP-backed** deterministic typed symbol graph — correctness first (users install the LSP).
-- Ships as a **portable MCP daemon** (works in any MCP harness) + a thin **Claude Code
-  adapter** (hooks + CLAUDE.md). Claude Code first.
+- **Daemon in Go**; ships as a **portable MCP daemon** (any MCP harness) + a thin **Claude
+  Code adapter** (hooks + CLAUDE.md). Claude Code first.
+- **First target: TypeScript** via **`tsgo --lsp`** (TS 7 native), out-of-process behind a
+  `LanguageProvider` interface (polyglot via other LSP servers later).
+- **Thin graph layer:** LSP passthrough for point queries; a lightweight materialized index
+  (in-memory adjacency + SQLite) only for derived queries (repo-map/PageRank, blast-radius).
 - **Staleness is the hard problem:** a blocking `PostToolUse` hook is a deterministic sync
   barrier; freshness metadata + model instruction back it up.
 - **Never deny grep** — a search-strategy doc (always in context) teaches graph-vs-grep.
-- **TypeScript first:** daemon in TS/Node, first target language TS via the TS Language
-  Service API in-process (polyglot via LSP later).
-- **Budget-shaped eval from day one:** free retrieval-correctness CI gate + cheap
-  navigation-efficiency signal + a tiny milestone-only task-capability set (Max quota is the
-  real budget). Two-arm delta, stratified by nav spread.
+- **Budget-shaped eval from day one:** free retrieval-correctness CI gate + a model-agnostic
+  runner where a **local model carries free high-volume runs** and Claude arms are
+  quota-boxed. `{local, Claude} × {graph, no-graph}`, stratified by nav spread — measures the
+  graph's effect *and* whether it helps weaker models more.
 - Windows ↔ WSL path handling as a first-class differentiator.

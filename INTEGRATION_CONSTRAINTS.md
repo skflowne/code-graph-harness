@@ -37,6 +37,9 @@ Serena (MCP-wrapped LSP, works in Claude Code + others) is the existence proof.
 | 5 | **Trust** | Not a concern. Accuracy is the whole point of the system. | Precision + freshness by design. |
 | 6 | **Distribution** | Proper **Windows ↔ WSL path handling** from the start. | Differentiator — most tools get this wrong. |
 | 7 | **Observability** | **Full stack early**, and a **correctness/eval rig from day one.** | Only way to know if we're actually helping. See `EVAL.md`. |
+| 8 | **Daemon language** | **Go.** | Concurrency fit for the staleness barrier + AI-reliable + prod MCP SDK + same lang as tsgo. See `PLAN.md` §Why Go. |
+| 9 | **TS analysis** | Out-of-process via **`tsgo --lsp`** (TS 7 native). | In-process TS Language Service is gone in TS 7 → staleness barrier needed for TS from day one (but tsgo is ~10× faster → cheap barrier). |
+| 10 | **Eval volume** | Carried by a **local model** (free); Claude arms quota-boxed. | Max quota is the budget; local runs give statistical power + a model-interaction study. See `EVAL.md`. |
 
 ---
 

@@ -7,17 +7,36 @@
 ---
 
 ## Stack decisions
-- **Daemon implementation:** TypeScript / Node.
-- **First target language:** TypeScript — via the **TS Language Service API in-process**
-  (max precision, no separate LSP process), behind a `LanguageProvider` interface. Other
-  languages implement the same interface via generic LSP clients later.
-- **Eval default model:** Sonnet (cheap iteration); Opus for occasional validation only.
+- **Daemon implementation: Go.**
+- **First target language: TypeScript**, analyzed via **`tsgo --lsp`** (the TS 7 native Go
+  compiler's LSP server) — out-of-process, behind a `LanguageProvider` interface. Other
+  languages implement the same interface via their own LSP servers (pyright, gopls,
+  rust-analyzer) later. **Everything is out-of-process LSP** — the old in-process TS
+  Language Service is gone in TS 7 (Corsa dropped the Strada API; programmatic API is IPC,
+  WIP until 7.1).
+- **Eval:** model-agnostic runner; local model carries free high-volume runs, Claude arms
+  are quota-boxed validation. See `EVAL.md`.
+
+### Why Go (over TypeScript / Rust)
+- The hardest, most correctness-critical component — the **staleness barrier + multi-LSP
+  orchestration** — is a concurrency problem. Go's goroutines/channels map onto it directly,
+  and `go test -race` catches the exact bug class (stale reads from races).
+- **AI-authored Go is reliable** (simple, uniform, great stdlib) — matters because AI writes
+  most of this. Async Rust is the least reliable for AI to generate; TS/Node is single-thread
+  (worker_threads + uncatchable async races) — the worst runtime fit for the barrier.
+- **MCP Go SDK is production-ready** (v1.4.x); Rust's is less prominent.
+- **Same language as tsgo** — tooling/version affinity now, and first in line for an
+  in-process option if MS opens the API in 7.1+ (blocked today: tsgo internals are under
+  `internal/`, unimportable externally).
+- The **graph layer is thin** (see below), so Rust's perf edge on a bespoke graph engine
+  doesn't apply — we deliberately don't build that.
+
+---
 
 ## Architecture
 
-One long-lived **daemon** = the portable core, with **two client faces on one process**.
-This shape is forced by the staleness decision: the hook and the model must talk to the
-same live LSP/graph state.
+One long-lived **Go daemon** = the portable core, **two client faces on one process**
+(forced by staleness: the hook and the model must share live LSP/graph state).
 
 ```
 ┌──────────────── Claude Code (harness adapter lives here) ───────────────┐
@@ -30,53 +49,85 @@ same live LSP/graph state.
       graph tools                           "file X changed: sync + wait"
             │                                          │
             ▼                                          ▼
-┌────────────────────── Graph Daemon (portable core) ─────────────────────┐
-│  LSP client pool ....... pyright, tsserver, gopls, rust-analyzer …      │
-│  Query / graph layer ... definition, refs, type, members, callers…      │
-│  Freshness tracker ..... per-file dirty state + monotonic generation    │
-│  FS watcher ............ catches out-of-band edits (git, external editor)│
+┌───────────────────── Graph Daemon — Go (portable core) ─────────────────┐
+│  LSP client pool ....... tsgo --lsp (TS), pyright, gopls, rust-analyzer  │
+│  Query router .......... point queries → LSP passthrough (no storage)   │
+│  Materialized index .... in-memory adjacency + SQLite (derived queries) │
+│  Freshness tracker ..... per-file dirty + monotonic generation          │
+│  FS watcher ............ out-of-band edits (git, external editor)        │
 │  Path normalizer ....... WSL ↔ Windows                                  │
 │  Telemetry ............. JSONL + OTEL, session + graph_mode tagged       │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Cross-cutting principles:** signatures-not-bodies default · symbol-name-path addressing
-(not line numbers — offsets shift under edits we didn't observe) · cap/paginate every tool
-· never deny grep · bounded waits everywhere · accept honest null results.
+(offsets shift under edits we didn't observe) · cap/paginate every tool · never deny grep ·
+bounded waits everywhere · accept honest null results.
+
+---
+
+## The graph layer
+
+The LSP **already holds the semantic graph.** So the layer is thin:
+
+- **Point queries → LSP passthrough, no storage.** `find_definition`, `find_references`,
+  `get_type`, `get_members`, implementations. Always fresh (the barrier keeps the LSP
+  current), shaped + freshness-tagged, returned. Phase 0 is entirely this.
+- **Derived / aggregate queries → a lightweight materialized index** (an index *over* the
+  LSP's knowledge), for what LSP does poorly:
+  - repo-map ranking (PageRank over the symbol reference graph — the SessionStart injection),
+  - impact / blast-radius (transitive closure),
+  - interface → consumer expansion (multi-hop architectural tracing),
+  - import/dependency overview.
+
+**Node/edge schema (modest, structural — not every ref edge):**
+```
+Nodes:  symbol { id, name, kind, file, range, signature? } · file · module
+Edges:  contains · imports · extends/implements · calls · references(sampled/lazy)
+```
+Precise reference edges (millions) are fetched on demand from the LSP, not stored. The
+approximate ref graph for PageRank comes from a fast syntactic pass.
+
+**Storage: in-memory adjacency (hot traversal / PageRank) + SQLite index
+(`modernc.org/sqlite`, pure-Go, FTS5 for name search). No graph DB** — our patterns are
+lookups + shallow traversals + PageRank; Kùzu/Neo4j would be overkill + heavy native deps.
+
+**Freshness — two tracks off the same `PostToolUse` hook:** (1) the LSP barrier for precise
+queries; (2) incremental re-parse of the edited file to patch the materialized index.
+
+Enters the build at **Phase 2** (repo-map) and **Phase 3** (impact). Phases 0–1 don't need it.
 
 ---
 
 ## The staleness barrier (the hard core — Phase 1)
 
-Three-layer defense (deepest first):
+In TS 7 all languages (incl. TS) are analyzed **out-of-process via LSP**, so there is no
+in-process freshness freebie for anyone — but tsgo is ~10× faster, so re-analysis after an
+edit is cheap, which keeps the barrier's wait short. Three-layer defense (deepest first):
 1. **Deterministic barrier (primary):** blocking `PostToolUse` → tiny hook CLI → daemon
    control socket → LSP `didChange`/`didSave` → **wait for settle** → return. The model's
    turn cannot continue until the graph is current.
-2. **Freshness metadata (safety net):** every result carries `generation` + `stale`; the
-   daemon always knows which files are dirty (LSP processes requests in-order after
-   `didChange`, results tied to document version).
+2. **Freshness metadata (safety net):** every result carries `generation` + `stale`.
 3. **Model instruction (last resort):** search-strategy doc — how to react to `stale: true`.
 
-**"Settle" detection research spike** (no universal LSP signal): in-order-request probe on
-the edited file + `$/progress` (rust-analyzer) + diagnostics quiescence + **bounded wait
-(≤~1–2s) with generation tag**. Never hang the model. Prototype on pyright first,
-rust-analyzer last (hardest, most explicit indexing).
+**"Settle" detection research spike** (no universal LSP signal): in-order-request probe +
+`$/progress` + diagnostics quiescence + **bounded wait (≤~1–2s) with generation tag**.
+Never hang the model. Prototype on tsgo first (TS is target #1), other servers later.
 
 ---
 
 ## Phases
 
 ### Phase 0 — Walking skeleton + telemetry spine + Tier A scaffold
-- Daemon (TypeScript/Node): MCP (stdio) + control socket, project-keyed path.
-- **First language: TypeScript via the TS Language Service API in-process**, behind a
-  `LanguageProvider` interface (so polyglot-via-LSP is a later drop-in).
-- Tools v0: `find_definition`, `find_references`, `get_outline` (signatures, capped,
-  carry `generation` + `stale` fields even if trivially fresh).
+- Go daemon: MCP (stdio) + control socket, project-keyed path.
+- **`tsgo --lsp` client** as the first `LanguageProvider` (out-of-process LSP).
+- Tools v0: `find_definition`, `find_references`, `get_outline` — pure LSP passthrough
+  (signatures, capped, carry `generation` + `stale` even if trivially fresh).
 - **Path normalizer (WSL ↔ Windows) from the start.**
-- **Telemetry spine (full stack, per decision #7):** JSONL event stream + OTEL exporter +
-  session/`graph_mode` tagging.
+- **Telemetry spine (full stack):** JSONL event stream + OTEL exporter + session/`graph_mode`
+  tagging.
 - **Tier A eval scaffold:** retrieval-correctness harness on a pinned TS repo.
-- *Exit:* MCP round-trip works; every call is logged; Tier A green on a pinned repo.
+- *Exit:* MCP round-trip works; every call logged; Tier A green on a pinned repo.
 
 ### Phase 1 — Staleness barrier + freshness + Tier A live
 - Freshness tracker (per-file dirty, monotonic generation).
@@ -87,34 +138,36 @@ rust-analyzer last (hardest, most explicit indexing).
   (the barrier's regression gate).
 - *Exit:* no stale reads under scripted edit races; barrier latency within budget.
 
-### Phase 2 — Adoption layer + Tier B v1 (thesis test online) + full observability
-- CLAUDE.md **search-strategy** (when graph vs grep, stale-flag protocol) + strong tool
-  descriptions.
-- `SessionStart` hook: inject PageRank repo-map (≤10k chars) + graph status.
-- **Tier B (navigation efficiency):** cheap fixed-question set, two-arm, Sonnet, stratified
-  by spread → first affordable graph-vs-baseline signal (tokens-to-answer). See `EVAL.md`.
+### Phase 2 — Materialized graph + adoption layer + Tier B (thesis signal)
+- Materialized structural index (in-memory + SQLite); incremental re-parse on edit.
+- PageRank repo-map; `SessionStart` hook injects it (≤10k chars) + graph status.
+- CLAUDE.md **search-strategy** (graph vs grep, stale-flag protocol) + strong tool descriptions.
+- **Model-agnostic eval runner** + **Tier B (navigation efficiency):** `{local, Claude} ×
+  {graph, no-graph}`, stratified by spread. Local carries volume; Claude quota-boxed. See
+  `EVAL.md`.
 - **Full observability:** OTEL token join by session_id + live dashboard.
-- *Exit:* reproducible token-to-answer delta, sliced by spread.
+- *Exit:* reproducible tokens-to-answer delta, sliced by spread and model.
 
-### Phase 3 — Breadth (tools + languages), eval expands
+### Phase 3 — Breadth (tools + languages), Tier C
 - Tools: `get_type`, `get_members`, `get_callers`/`get_callees`, `who_imports`/`imports_of`,
-  `impact`, `get_source`. Prioritize typed edges (`extends`/`implements`/`type-of`) +
-  interface→consumer expansion; bidirectional traversal (per `INITIAL_RESEARCH.md` §4c).
+  `impact` (blast-radius), `get_source`. Prioritize typed edges (`extends`/`implements`/
+  `type-of`) + interface→consumer expansion; bidirectional traversal (`INITIAL_RESEARCH.md`
+  §4c).
 - Languages via LSP registry: pyright, gopls, rust-analyzer (install hints, graceful
   degradation on missing servers).
-- **Tier C (task capability):** tiny curated TS task set (~10–20) from Multi-SWE-bench /
-  SWE-bench Multilingual TS subset + hand-curated multi-file tasks. Milestone-only, Sonnet
-  default, Opus spot-check. See `EVAL.md`.
+- **Tier C (task capability):** tiny curated TS set (~10–20) from Multi-SWE-bench /
+  SWE-bench Multilingual TS subset + hand-curated multi-file tasks; `{local, Claude} ×
+  {graph, no-graph}`; milestone-only.
 
 ### Phase 4 — Hardening & portability
-- Portable-core audit: zero Claude-Code assumptions in the daemon; **second harness adapter
-  (Cursor)** as proof of portability.
+- Portable-core audit: zero Claude-Code assumptions in the daemon; second harness adapter
+  (Cursor) as proof.
 - Perf: LSP warmup, big-repo indexing, coalescing, caching.
 - Dashboard polish; continuous eval in CI.
 
 ---
 
 ## Immediate next step
-Phase 0 skeleton (TypeScript/Node): daemon (MCP stdio + control socket) + TS Language
-Service provider + 3 tools + path normalizer + JSONL telemetry + Tier A scaffold on a
-pinned TS repo.
+Phase 0 skeleton (Go): daemon (MCP stdio + control socket) + `tsgo --lsp` provider + 3
+passthrough tools + WSL↔Windows path normalizer + JSONL/OTEL telemetry + Tier A scaffold on
+a pinned TS repo.
