@@ -17,12 +17,32 @@ volume is carried by a **local model** (free — runs on our own compute), and C
 
 We run **two harnesses**, and the **local model is the common thread run in both** — it's
 free, carries the volume, and isolates the harness effect (same model, vary harness × graph).
-The frontier arm is **harness-bound** (Pi can't run Claude):
+The frontier arm differs by harness because of **how each provider gates access**, not
+capability:
+
+- **Anthropic's Max subscription is harness-locked** — it only powers first-party products
+  (Claude Code). As of early 2026 Anthropic explicitly **bars using subscription OAuth tokens in
+  third-party tools**, and the only subscription-covered programmatic paths (the `claude` CLI,
+  the Agent SDK) all wrap Claude Code's *own* agent loop — there is no raw-model backend. So you
+  cannot run Claude-the-model inside a minimal harness like Pi on the subscription; that requires
+  a **pay-as-you-go Anthropic API key**.
+- **OpenAI's API is harness-agnostic** — pay-as-you-go, but it behaves identically no matter what
+  drives it. That neutrality is exactly what makes a clean-room minimal harness like Pi **usable
+  as a frontier eval arm at all** — it's the load-bearing reason, not a grudging fallback.
+  Choosing OpenAI *also* yields a second frontier *family* (generalization, H4), but that's the
+  bonus, not the point.
+
+So Pi's frontier arm is **OpenAI** (cheap tier, kept sparse).
 
 | Harness | Scaffolding | Frontier arm | Local arm (common) |
 |---|---|---|---|
 | **Claude Code** | rich (product context) | Claude (Max-covered) | Qwen3-Coder-30B-A3B (free) |
-| **Pi** | minimal (clean-room control) | OpenAI (pay-$, sparse) | Qwen3-Coder-30B-A3B (free) |
+| **Pi** | minimal (clean-room control) | OpenAI (harness-agnostic API, sparse $) | Qwen3-Coder-30B-A3B (free) |
+
+> Verified (2026): the Max subscription cannot power Claude as a plain model backend in a
+> third-party harness — subscription OAuth is barred from third-party tools, and the CLI/Agent-SDK
+> paths embed Claude Code's harness. See Anthropic's
+> [Claude Code authentication docs](https://code.claude.com/docs/en/authentication).
 
 **How each is driven:**
 - **Claude Code:** backend swapped via `ANTHROPIC_BASE_URL` — Claude natively, or the local

@@ -15,8 +15,11 @@
   Language Service is gone in TS 7 (Corsa dropped the Strada API; programmatic API is IPC,
   WIP until 7.1).
 - **Target harnesses:** **Claude Code** (rich, product-first) + **Pi** (minimal, bare-bones
-  control) — two thin adapters over the portable Go core. Pi can't run Claude, so its frontier
-  arm is OpenAI. See `EVAL.md`.
+  control) — two thin adapters over the portable Go core. Pi's frontier arm is **OpenAI** —
+  Anthropic's Max subscription is harness-locked (first-party only; subscription OAuth is barred
+  from third-party tools), so Claude-in-Pi would need a pay-as-you-go API key, whereas OpenAI's
+  API is harness-agnostic and runs cleanly in a minimal harness (which is what makes Pi usable as
+  a frontier arm). See `EVAL.md`.
 - **Eval:** no separate runner — Claude Code swaps backend via `ANTHROPIC_BASE_URL` (Claude /
   local via Ollama); Pi runs its own providers. Local model (Qwen3-Coder-30B-A3B) is the free
   common thread in both.
