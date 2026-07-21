@@ -5,3 +5,6 @@ target/
 *.log
 .DS_Store
 scratch/
+
+# Go daemon build artifact (built at repo root by `go build ./cmd/cgraphd`)
+/cgraphd
