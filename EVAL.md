@@ -37,6 +37,13 @@ minimal *harness*, so we can claim the graph **generalizes** — not "helps Clau
 Code," but "helps frontier + local models across rich and bare-bones harnesses." Pi is the
 low-scaffolding control (recall harness scaffolding swings results 10–20 pts).
 
+**Pi gives the hardest, fairest baseline.** Pi is *minimal core + deeply extensible*: our
+graph is the independent variable (added as an extension), not scaffolding pollution. So the
+**graph-off** Pi arm is genuinely `model + Read/Write/Edit/Bash + grep-via-bash` — essentially
+the mini-swe-agent baseline the literature says sophisticated retrieval must beat. A graph win
+*there* is a credible win. **Caveat:** Pi self-extends at runtime → **freeze + pin the harness
++ extension set per run**; keep graph-on/off identical except our stack.
+
 **Hypotheses:**
 - **H1 (main effect):** graph improves each (harness, model) cell.
 - **H2 (interaction):** graph helps the weaker/local model **more** — strong models
@@ -134,9 +141,8 @@ underwrites confidence in the machinery.
   — Claude Code swaps backend via `ANTHROPIC_BASE_URL`; Pi runs its own providers.
 
 ## Open items (Phase 2)
-- **Pi adapter** — tool exposure (MCP-adapter package vs native TS extension) and whether a Pi
-  extension can wrap Edit/Write to fire the staleness barrier (else Pi = freshness-metadata +
-  model-instruction only). See `PLAN.md`.
+- **Pi adapter** — confirm the pre/post tool-wrap API (graph tools + Edit/Write-wrapping
+  barrier as extensions); pin the frozen harness+extension set for reproducibility. See `PLAN.md`.
 - **OpenAI arm** — pick a cheap tier / OpenRouter to bound out-of-pocket $; keep sparse.
 - Spread-bin thresholds (compute from gold patches; calibrate on a pilot).
 - Final Tier B question set + Tier C task list (TS sources vs curated).

@@ -165,11 +165,14 @@ Never hang the model. Prototype on tsgo first (TS is target #1), other servers l
 
 ### Phase 4 — Hardening & second harness adapter (Pi)
 - Portable-core audit: zero Claude-Code assumptions in the daemon.
-- **Pi adapter** (minimal harness, doubles as the eval clean-room): expose graph tools via an
-  MCP-adapter package or a native Pi TS extension over the daemon; inject the repo-map via a Pi
-  Prompt Template/Skill. **Barrier caveat:** Pi has no `PostToolUse` hook — if a Pi extension
-  can wrap Edit/Write, fire the barrier there; else Pi runs on freshness-metadata +
-  model-instruction only (weaker, but a natural experiment on the barrier's value).
+- **Pi adapter** — Pi is *minimal core + deeply extensible* (MCP/hooks are primitives you
+  supply, not baked in). So we build our own integration as TS extensions: graph tools via a
+  native Pi extension over the daemon; the **staleness barrier as an Edit/Write-wrapping
+  extension** (Pi's own "hook" — expected fully doable, not a fallback; confirm the pre/post
+  wrap API when building); repo-map via a Prompt Template/Skill.
+- **Pi reproducibility:** Pi self-extends at runtime, so **freeze + pin the harness + extension
+  set per eval run**, and keep graph-on/off identical except our stack — else the harness
+  becomes an uncontrolled variable.
 - Perf: LSP warmup, big-repo indexing, coalescing, caching.
 - Dashboard polish; continuous eval in CI.
 
