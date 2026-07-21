@@ -7,11 +7,20 @@ are its properties, where is it used") by graph lookup instead of expensive text
 
 ## Status
 
-Planning complete; Phase 0 next. Docs:
+**Phase 0 complete** — walking skeleton: a Go daemon (`cgraphd`) with an MCP stdio server, three
+passthrough tools (`find_definition` / `find_references` / `get_outline`) over a `tsgo --lsp`
+provider, JSONL telemetry, WSL↔Windows path handling, and a Tier A retrieval-correctness gate that
+drives the real daemon over MCP. 100 tests across 8 packages. **Phase 1 (the staleness barrier) is
+next.**
+
+Docs:
+- [`ARCHITECTURE.md`](./ARCHITECTURE.md) — **visual architecture** (Mermaid diagrams): components, request flow, the staleness barrier, package graph, phase roadmap.
 - [`INITIAL_RESEARCH.md`](./INITIAL_RESEARCH.md) — evidence: tokens vs correctness, prior art.
 - [`INTEGRATION_CONSTRAINTS.md`](./INTEGRATION_CONSTRAINTS.md) — building into Claude Code; decisions + problem map.
 - [`EVAL.md`](./EVAL.md) — how we measure whether it actually helps (from day one).
 - [`PLAN.md`](./PLAN.md) — architecture + phased build sequence.
+- [`PHASE0_PARALLEL.md`](./PHASE0_PARALLEL.md) — how Phase 0 was decomposed for a parallel build.
+- [`AGENTS.md`](./AGENTS.md) — working conventions for agents/contributors (build, test, keeping docs current).
 
 ## Direction (settled)
 
