@@ -3,12 +3,14 @@ package mcp
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -17,17 +19,15 @@ import (
 	"github.com/skflowne/code-graph-harness/internal/core"
 )
 
-// SocketPath derives the project-keyed control-socket path for cfg:
-// cfg.ControlSocket verbatim if set, otherwise
-// /tmp/cgraphd-<12-hex-char-hash-of-ProjectRoot>.sock, so one daemon per
-// project root gets a stable, collision-resistant path without requiring
-// config.
+// SocketPath derives the project-keyed control-socket path for cfg. Explicit
+// paths are used verbatim; default paths live in a private per-user runtime
+// directory rather than the shared temporary directory.
 func SocketPath(cfg core.Config) string {
 	if cfg.ControlSocket != "" {
 		return cfg.ControlSocket
 	}
 	sum := sha256.Sum256([]byte(cfg.ProjectRoot))
-	return fmt.Sprintf("/tmp/cgraphd-%s.sock", hex.EncodeToString(sum[:])[:12])
+	return filepath.Join(controlRuntimeDir(), fmt.Sprintf("cgraphd-%s.sock", hex.EncodeToString(sum[:])[:12]))
 }
 
 // ControlSocket is the Phase 0 scaffold for the Phase 1 staleness barrier: a
@@ -50,6 +50,7 @@ type ControlSocket struct {
 	// socketInfo identifies the inode created by net.Listen. It prevents a
 	// later owner from being removed when this instance shuts down.
 	socketInfo os.FileInfo
+	authorize  func(net.Conn) error
 
 	acceptWG     sync.WaitGroup
 	handlers     sync.WaitGroup
@@ -63,7 +64,12 @@ type ControlSocket struct {
 // NewControlSocket builds a ControlSocket bound to path, bumping/reading gen
 // on commands. Call Start to begin listening.
 func NewControlSocket(path string, gen *core.GenerationCounter) *ControlSocket {
-	return &ControlSocket{path: path, gen: gen, connections: make(map[net.Conn]struct{})}
+	return &ControlSocket{
+		path:        path,
+		gen:         gen,
+		authorize:   authorizeControlPeer,
+		connections: make(map[net.Conn]struct{}),
+	}
 }
 
 // Path returns the unix-socket path this ControlSocket listens (or will
@@ -71,22 +77,25 @@ func NewControlSocket(path string, gen *core.GenerationCounter) *ControlSocket {
 func (c *ControlSocket) Path() string { return c.path }
 
 // Start acquires exclusive ownership of c.Path(), binds a new unix-socket
-// listener, and begins accepting connections in a background goroutine. A
-// companion lock file is intentionally persistent; flock releases ownership
-// when the process exits without introducing an unlink race.
+// listener, and begins accepting connections in a background goroutine. The
+// ownership lock lives in a private runtime directory and is opened without
+// following symlinks.
 func (c *ControlSocket) Start(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("control socket: nil context")
 	}
+	if err := ensureControlRuntimeDir(); err != nil {
+		return fmt.Errorf("control socket: preparing private runtime directory: %w", err)
+	}
 
-	lockPath := c.path + ".lock"
-	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	lockPath := ownershipLockPath(c.path)
+	lockFile, err := openOwnershipLock(lockPath)
 	if err != nil {
 		return fmt.Errorf("control socket: opening ownership lock %s: %w", lockPath, err)
 	}
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := tryLockFile(lockFile); err != nil {
 		_ = lockFile.Close()
-		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+		if isLockBusy(err) {
 			return fmt.Errorf("control socket %s is already owned by another daemon", c.path)
 		}
 		return fmt.Errorf("control socket: locking %s: %w", lockPath, err)
@@ -98,27 +107,28 @@ func (c *ControlSocket) Start(ctx context.Context) error {
 		return err
 	}
 
-	ln, err := net.Listen("unix", c.path)
+	ln, stagedPath, stagedInfo, err := listenStaged(c.path)
 	if err != nil {
 		c.releaseLock()
 		return fmt.Errorf("control socket: listen %s: %w", c.path, err)
 	}
-	// net.UnixListener.Close normally unlinks its pathname. Disable that
-	// behavior so cleanup can remove the path only while it still names our
-	// listener; otherwise closing an unlinked listener could remove a
-	// replacement socket that another owner installed at the same path.
-	if unixListener, ok := ln.(*net.UnixListener); ok {
-		unixListener.SetUnlinkOnClose(false)
-	}
-	info, err := os.Lstat(c.path)
-	if err != nil {
+	// The staged socket is never accepted until it has restrictive mode and
+	// has atomically replaced the confirmed-stale pathname.
+	if err := os.Chmod(stagedPath, 0o600); err != nil {
 		_ = ln.Close()
+		_ = os.Remove(stagedPath)
 		c.releaseLock()
-		return fmt.Errorf("control socket: stat bound socket %s: %w", c.path, err)
+		return fmt.Errorf("control socket: chmod %s: %w", stagedPath, err)
 	}
-	c.listener = ln
-	c.socketInfo = info
+	if err := os.Rename(stagedPath, c.path); err != nil {
+		_ = ln.Close()
+		_ = os.Remove(stagedPath)
+		c.releaseLock()
+		return fmt.Errorf("control socket: installing %s: %w", c.path, err)
+	}
 
+	c.listener = ln
+	c.socketInfo = stagedInfo
 	c.acceptWG.Add(1)
 	go c.acceptLoop()
 	go func() {
@@ -128,8 +138,84 @@ func (c *ControlSocket) Start(ctx context.Context) error {
 	return nil
 }
 
-// preparePath rejects unsafe existing paths, probes socket paths for a live
-// listener, and removes only sockets confirmed to be stale.
+func controlRuntimeDir() string {
+	if base := os.Getenv("XDG_RUNTIME_DIR"); base != "" && filepath.IsAbs(base) {
+		return filepath.Join(base, "cgraphd")
+	}
+	if cache, err := os.UserCacheDir(); err == nil && filepath.IsAbs(cache) {
+		// A user-owned cache parent is a safer fallback than a predictable name
+		// directly beneath the shared temporary directory.
+		return filepath.Join(cache, "cgraphd-runtime")
+	}
+	return filepath.Join(os.TempDir(), fmt.Sprintf("cgraphd-%d", effectiveUserID()))
+}
+
+func ensureControlRuntimeDir() error {
+	dir := controlRuntimeDir()
+	if base := os.Getenv("XDG_RUNTIME_DIR"); base != "" && filepath.IsAbs(base) {
+		if err := validatePrivateDir(base); err != nil {
+			return fmt.Errorf("unsafe XDG_RUNTIME_DIR %s: %w", base, err)
+		}
+	} else if cache, err := os.UserCacheDir(); err == nil && filepath.IsAbs(cache) {
+		if err := os.MkdirAll(cache, 0o700); err != nil {
+			return fmt.Errorf("creating user cache directory: %w", err)
+		}
+		if err := validateUserOwnedDir(cache); err != nil {
+			return fmt.Errorf("unsafe user cache directory %s: %w", cache, err)
+		}
+	}
+	if err := os.Mkdir(dir, 0o700); err != nil && !os.IsExist(err) {
+		return err
+	}
+	return validatePrivateDir(dir)
+}
+
+func validateUserOwnedDir(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return errors.New("not a directory")
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("permissions %04o allow group or other writes", info.Mode().Perm())
+	}
+	if !ownedByEffectiveUser(info) {
+		return errors.New("not owned by the effective user")
+	}
+	return nil
+}
+
+func validatePrivateDir(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return errors.New("not a directory")
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("permissions %04o allow group or other access", info.Mode().Perm())
+	}
+	if !ownedByEffectiveUser(info) {
+		return errors.New("not owned by the effective user")
+	}
+	return nil
+}
+
+func ownershipLockPath(socketPath string) string {
+	absolute, err := filepath.Abs(socketPath)
+	if err != nil {
+		absolute = socketPath
+	}
+	sum := sha256.Sum256([]byte(absolute))
+	return filepath.Join(controlRuntimeDir(), fmt.Sprintf("lock-%s", hex.EncodeToString(sum[:])[:24]))
+}
+
+// preparePath rejects unsafe existing paths and probes socket paths for a live
+// listener. Stale sockets are not unlinked here: Start atomically replaces one
+// with its already-bound, permission-restricted staged listener.
 func (c *ControlSocket) preparePath() error {
 	info, err := os.Lstat(c.path)
 	if os.IsNotExist(err) {
@@ -150,10 +236,40 @@ func (c *ControlSocket) preparePath() error {
 	if !confirmedStaleSocket(err) {
 		return fmt.Errorf("control socket: probing %s: %w", c.path, err)
 	}
-	if err := os.Remove(c.path); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("control socket: removing stale socket %s: %w", c.path, err)
-	}
 	return nil
+}
+
+func listenStaged(path string) (net.Listener, string, os.FileInfo, error) {
+	dir := filepath.Dir(path)
+	for range 8 {
+		random := make([]byte, 8)
+		if _, err := rand.Read(random); err != nil {
+			return nil, "", nil, err
+		}
+		stagedPath := filepath.Join(dir, ".cg-"+hex.EncodeToString(random))
+		ln, err := net.Listen("unix", stagedPath)
+		if err != nil {
+			if os.IsExist(err) {
+				continue
+			}
+			return nil, "", nil, err
+		}
+		unixListener, ok := ln.(*net.UnixListener)
+		if !ok {
+			_ = ln.Close()
+			_ = os.Remove(stagedPath)
+			return nil, "", nil, errors.New("listener is not a unix listener")
+		}
+		unixListener.SetUnlinkOnClose(false)
+		info, err := os.Lstat(stagedPath)
+		if err != nil {
+			_ = ln.Close()
+			_ = os.Remove(stagedPath)
+			return nil, "", nil, err
+		}
+		return ln, stagedPath, info, nil
+	}
+	return nil, "", nil, errors.New("could not allocate a staged socket pathname")
 }
 
 func confirmedStaleSocket(err error) bool {
@@ -190,19 +306,44 @@ func (c *ControlSocket) beginShutdown() {
 func (c *ControlSocket) cleanup() {
 	c.cleanupOnce.Do(func() {
 		if c.socketInfo != nil {
-			if info, err := os.Lstat(c.path); err == nil && os.SameFile(info, c.socketInfo) {
-				_ = os.Remove(c.path)
-			}
+			c.removeOwnedSocket()
 		}
 		c.releaseLock()
 	})
+}
+
+// removeOwnedSocket first atomically moves the public pathname to an
+// unpredictable quarantine name. It only unlinks that private name after
+// verifying the moved inode; a replacement is restored instead.
+func (c *ControlSocket) removeOwnedSocket() {
+	// MkdirTemp atomically claims a mode-0700 quarantine directory on the
+	// socket's filesystem. Once the public name is moved inside, other local
+	// users cannot swap the private pathname between verification and unlink.
+	quarantineDir, err := os.MkdirTemp(filepath.Dir(c.path), ".cg-clean-")
+	if err != nil {
+		return
+	}
+	quarantine := filepath.Join(quarantineDir, "socket")
+	if err := os.Rename(c.path, quarantine); err != nil {
+		_ = os.Remove(quarantineDir)
+		return
+	}
+	info, err := os.Lstat(quarantine)
+	if err == nil && os.SameFile(info, c.socketInfo) {
+		_ = os.Remove(quarantine)
+		_ = os.Remove(quarantineDir)
+		return
+	}
+	// The public name was replaced after Start. Put that inode back; never
+	// remove it as part of this instance's cleanup.
+	_ = os.Rename(quarantine, c.path)
+	_ = os.Remove(quarantineDir)
 }
 
 func (c *ControlSocket) releaseLock() {
 	if c.lockFile == nil {
 		return
 	}
-	_ = syscall.Flock(int(c.lockFile.Fd()), syscall.LOCK_UN)
 	_ = c.lockFile.Close()
 	c.lockFile = nil
 }
@@ -213,6 +354,10 @@ func (c *ControlSocket) acceptLoop() {
 		conn, err := c.listener.Accept()
 		if err != nil {
 			return
+		}
+		if err := c.authorize(conn); err != nil {
+			_ = conn.Close()
+			continue
 		}
 
 		c.connMu.Lock()
