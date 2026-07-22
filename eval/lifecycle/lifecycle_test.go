@@ -12,57 +12,30 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
-	"sync"
-	"syscall"
 	"testing"
 	"time"
-)
 
-const (
-	pollInterval = 10 * time.Millisecond
-	shortWait    = 5 * time.Second
+	"github.com/skflowne/code-graph-harness/eval/testinfra"
 )
 
 var daemonBin string
 
 func TestMain(m *testing.M) {
-	root := moduleRoot()
-	tmp, err := os.MkdirTemp("", "lifecycle-bin-")
+	var cleanup func()
+	var err error
+	daemonBin, cleanup, err = testinfra.BuildDaemon()
 	if err != nil {
-		panic(err)
-	}
-	daemonBin = filepath.Join(tmp, "cgraphd")
-	build := exec.Command("go", "build", "-o", daemonBin, "./cmd/cgraphd")
-	build.Dir = root
-	build.Stderr = os.Stderr
-	if err := build.Run(); err != nil {
-		panic("lifecycle: building cgraphd: " + err.Error())
+		panic("lifecycle: " + err.Error())
 	}
 	code := m.Run()
-	_ = os.RemoveAll(tmp)
+	cleanup()
 	os.Exit(code)
-}
-
-func moduleRoot() string {
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		return "."
-	}
-	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
-}
-
-func fixtureRoot(t *testing.T) string {
-	t.Helper()
-	return filepath.Join(moduleRoot(), "eval", "tiera", "fixtures")
 }
 
 func requireLifecycleSupport(t *testing.T) {
 	t.Helper()
-	if runtime.GOOS == "windows" {
-		t.Skip("lifecycle tests require Unix sockets and signals")
-	}
+	testinfra.RequireSupport(t)
 	if _, err := exec.LookPath("tsgo"); err != nil {
 		t.Skip("tsgo not on PATH")
 	}
@@ -75,197 +48,28 @@ func requireLifecycleSupport(t *testing.T) {
 	_ = os.Remove(probe)
 }
 
-type stderrCapture struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (c *stderrCapture) Write(p []byte) (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.buf.Write(p)
-}
-
-func (c *stderrCapture) String() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.buf.String()
-}
-
-type daemonProcess struct {
-	cmd      *exec.Cmd
-	stdin    io.WriteCloser
-	stderr   *stderrCapture
-	pidFile  string
-	childPID int
-
-	waitDone chan struct{}
-	waitMu   sync.Mutex
-	exitErr  error
-	cleaned  bool
-}
-
-func newDaemon(t *testing.T, socket string) *daemonProcess {
+func newDaemon(t *testing.T, socket string) *testinfra.Daemon {
 	t.Helper()
-	realTsgo, err := exec.LookPath("tsgo")
-	if err != nil {
-		t.Skip("tsgo not on PATH")
-	}
-	dir := t.TempDir()
-	pidFile := filepath.Join(dir, "tsgo.pid")
-	wrapper := filepath.Join(dir, "tsgo-wrapper.sh")
-	script := "#!/bin/sh\necho $$ > \"$CGRAPH_TSGO_PID_FILE\"\nexec \"$CGRAPH_REAL_TSGO\" \"$@\"\n"
-	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
-		t.Fatalf("writing tsgo wrapper: %v", err)
-	}
-
-	stderr := &stderrCapture{}
-	cmd := exec.Command(daemonBin,
-		"--project-root", fixtureRoot(t),
-		"--jsonl", filepath.Join(dir, "telemetry.jsonl"),
-		"--session-id", "lifecycle",
-		"--graph-mode", "graph",
-		"--tsgo", wrapper,
-		"--control-socket", socket,
-	)
-	cmd.Env = append(os.Environ(),
-		"CGRAPH_REAL_TSGO="+realTsgo,
-		"CGRAPH_TSGO_PID_FILE="+pidFile,
-	)
-	cmd.Stdout = io.Discard
-	cmd.Stderr = stderr
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		t.Fatalf("opening daemon stdin: %v", err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("starting daemon: %v", err)
-	}
-	d := &daemonProcess{
-		cmd:      cmd,
-		stdin:    stdin,
-		stderr:   stderr,
-		pidFile:  pidFile,
-		waitDone: make(chan struct{}),
-	}
-	go func() {
-		err := cmd.Wait()
-		d.waitMu.Lock()
-		d.exitErr = err
-		d.waitMu.Unlock()
-		close(d.waitDone)
-	}()
-	t.Cleanup(func() { d.cleanup(t) })
-	return d
+	return testinfra.NewDaemon(t, testinfra.Config{
+		Binary:        daemonBin,
+		ProjectRoot:   testinfra.FixtureRoot(),
+		SessionID:     "lifecycle",
+		ControlSocket: socket,
+	})
 }
 
-func startDaemon(t *testing.T, socket string) *daemonProcess {
+func startDaemon(t *testing.T, socket string) (*testinfra.Daemon, int) {
 	t.Helper()
 	d := newDaemon(t, socket)
-	if err := waitForSocket(d, socket, shortWait); err != nil {
-		t.Fatalf("waiting for daemon readiness: %v (stderr=%s)", err, d.stderr.String())
+	if err := d.WaitForSocket(socket, testinfra.ShortWait); err != nil {
+		t.Fatalf("waiting for daemon readiness: %v (stderr=%s)", err, d.Stderr())
 	}
-	if err := waitForFile(d, d.pidFile, shortWait); err != nil {
-		t.Fatalf("waiting for tsgo PID: %v (stderr=%s)", err, d.stderr.String())
-	}
-	d.childPID = readPID(t, d.pidFile)
-	return d
-}
-
-func waitForSocket(d *daemonProcess, path string, timeout time.Duration) error {
-	return poll(timeout, func() (bool, error) {
-		select {
-		case <-d.waitDone:
-			return false, fmt.Errorf("daemon exited: %v", d.exitError())
-		default:
-		}
-		conn, err := net.DialTimeout("unix", path, 100*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
-			return true, nil
-		}
-		return false, nil
-	})
-}
-
-func waitForFile(d *daemonProcess, path string, timeout time.Duration) error {
-	return poll(timeout, func() (bool, error) {
-		select {
-		case <-d.waitDone:
-			return false, fmt.Errorf("daemon exited: %v", d.exitError())
-		default:
-		}
-		_, err := os.Stat(path)
-		return err == nil, nil
-	})
-}
-
-func poll(timeout time.Duration, condition func() (bool, error)) error {
-	deadline := time.Now().Add(timeout)
-	for {
-		ok, err := condition()
-		if err != nil {
-			return err
-		}
-		if ok {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return errors.New("deadline exceeded")
-		}
-		remaining := time.Until(deadline)
-		wait := pollInterval
-		if remaining < wait {
-			wait = remaining
-		}
-		timer := time.NewTimer(wait)
-		<-timer.C
-	}
-}
-
-func (d *daemonProcess) exitError() error {
-	d.waitMu.Lock()
-	defer d.waitMu.Unlock()
-	return d.exitErr
-}
-
-func (d *daemonProcess) waitForExit(timeout time.Duration) (error, bool) {
-	select {
-	case <-d.waitDone:
-		return d.exitError(), true
-	case <-time.After(timeout):
-		return nil, false
-	}
-}
-
-func readPID(t *testing.T, path string) int {
-	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("reading PID file %s: %v", path, err)
-	}
-	var pid int
-	if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &pid); err != nil || pid <= 0 {
-		t.Fatalf("invalid PID file %s: %q", path, data)
-	}
-	return pid
-}
-
-func pidExists(pid int) bool {
-	err := syscall.Kill(pid, 0)
-	return err == nil || !errors.Is(err, syscall.ESRCH)
-}
-
-func assertPIDGone(t *testing.T, pid int) {
-	t.Helper()
-	if err := poll(shortWait, func() (bool, error) { return !pidExists(pid), nil }); err != nil {
-		t.Errorf("process PID %d did not disappear: %v", pid, err)
-	}
+	return d, d.WaitForPID(t)
 }
 
 func assertPathGone(t *testing.T, path string) {
 	t.Helper()
-	if err := poll(shortWait, func() (bool, error) {
+	if err := testinfra.Poll(testinfra.ShortWait, func() (bool, error) {
 		_, err := os.Lstat(path)
 		return os.IsNotExist(err), nil
 	}); err != nil {
@@ -273,38 +77,19 @@ func assertPathGone(t *testing.T, path string) {
 	}
 }
 
-func (d *daemonProcess) cleanup(t *testing.T) {
-	if d.cleaned {
-		return
-	}
-	if d.stdin != nil {
-		_ = d.stdin.Close()
-	}
-	if _, ok := d.waitForExit(shortWait); !ok {
-		// Mark the test failed before any fallback process termination.
-		t.Errorf("daemon did not exit during cleanup; forcing termination")
-		if d.cmd.Process != nil {
-			_ = d.cmd.Process.Kill()
-		}
-		if d.childPID != 0 {
-			_ = syscall.Kill(d.childPID, syscall.SIGKILL)
-		}
-		_, _ = d.waitForExit(shortWait)
-	}
-	if d.childPID != 0 {
-		assertPIDGone(t, d.childPID)
-	}
-	d.cleaned = true
-}
-
 func controlCommand(t *testing.T, socket, command string) string {
 	t.Helper()
-	conn, err := net.DialTimeout("unix", socket, shortWait)
+	conn, err := net.DialTimeout("unix", socket, testinfra.ShortWait)
 	if err != nil {
 		t.Fatalf("dialing control socket: %v", err)
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(shortWait))
+	return commandOnConn(t, conn, command)
+}
+
+func commandOnConn(t *testing.T, conn net.Conn, command string) string {
+	t.Helper()
+	_ = conn.SetDeadline(time.Now().Add(testinfra.ShortWait))
 	if _, err := fmt.Fprintf(conn, "%s\n", command); err != nil {
 		t.Fatalf("writing control command: %v", err)
 	}
@@ -315,106 +100,109 @@ func controlCommand(t *testing.T, socket, command string) string {
 	return response
 }
 
+// acceptedIdleConnection proves the daemon accepted this exact client before
+// leaving it idle for the shutdown assertion.
+func acceptedIdleConnection(t *testing.T, socket string) net.Conn {
+	t.Helper()
+	conn, err := net.DialTimeout("unix", socket, testinfra.ShortWait)
+	if err != nil {
+		t.Fatalf("dialing idle control client: %v", err)
+	}
+	if got := commandOnConn(t, conn, "unknown command"); got != "err unknown\n" {
+		_ = conn.Close()
+		t.Fatalf("idle-client acceptance response = %q", got)
+	}
+	return conn
+}
+
 func assertIdleConnectionClosed(t *testing.T, conn net.Conn) {
 	t.Helper()
-	_ = conn.SetReadDeadline(time.Now().Add(shortWait))
+	_ = conn.SetReadDeadline(time.Now().Add(testinfra.ShortWait))
 	var one [1]byte
 	n, err := conn.Read(one[:])
-	if n != 0 || !errors.Is(err, io.EOF) {
-		t.Errorf("idle control connection was not closed with EOF: n=%d err=%v", n, err)
+	if n != 0 || (!errors.Is(err, io.EOF) && !testinfra.IsClosedConnError(err)) {
+		t.Errorf("idle control connection was not closed: n=%d err=%v", n, err)
 	}
 }
 
-func shutdownViaStdin(t *testing.T, d *daemonProcess) {
+func shutdownViaStdin(t *testing.T, d *testinfra.Daemon) {
 	t.Helper()
-	if err := d.stdin.Close(); err != nil {
+	if err := d.Stdin.Close(); err != nil {
 		t.Fatalf("closing daemon stdin: %v", err)
 	}
-	err, ok := d.waitForExit(shortWait)
+	err, ok := d.WaitForExit(testinfra.ShortWait)
 	if !ok {
 		t.Fatalf("daemon did not exit after stdin disconnect")
 	}
 	if err != nil {
-		t.Fatalf("daemon exited unsuccessfully after stdin disconnect: %v (stderr=%s)", err, d.stderr.String())
+		t.Fatalf("daemon exited unsuccessfully after stdin disconnect: %v (stderr=%s)", err, d.Stderr())
 	}
 }
 
 func TestMCPStdinDisconnectShutsDownEverything(t *testing.T) {
 	requireLifecycleSupport(t)
-	dir := t.TempDir()
-	socket := filepath.Join(dir, "control.sock")
-	d := startDaemon(t, socket)
+	socket := filepath.Join(t.TempDir(), "control.sock")
+	d, childPID := startDaemon(t, socket)
 	if got := controlCommand(t, socket, "sync file.ts"); got != "ok generation=1\n" {
 		t.Fatalf("sync response = %q", got)
 	}
 	if got := controlCommand(t, socket, "unknown command"); got != "err unknown\n" {
 		t.Fatalf("unknown response = %q", got)
 	}
-	idle, err := net.DialTimeout("unix", socket, shortWait)
-	if err != nil {
-		t.Fatalf("dialing idle control client: %v", err)
-	}
+	idle := acceptedIdleConnection(t, socket)
 	defer idle.Close()
 
 	shutdownViaStdin(t, d)
-	assertPIDGone(t, d.childPID)
+	testinfra.AssertPIDGone(t, childPID)
 	assertPathGone(t, socket)
 	assertIdleConnectionClosed(t, idle)
 }
 
 func TestSIGTERMWithIdleControlClient(t *testing.T) {
 	requireLifecycleSupport(t)
-	dir := t.TempDir()
-	socket := filepath.Join(dir, "control.sock")
-	d := startDaemon(t, socket)
-	idle, err := net.DialTimeout("unix", socket, shortWait)
-	if err != nil {
-		t.Fatalf("dialing idle control client: %v", err)
-	}
+	socket := filepath.Join(t.TempDir(), "control.sock")
+	d, childPID := startDaemon(t, socket)
+	idle := acceptedIdleConnection(t, socket)
 	defer idle.Close()
 
-	if err := d.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+	if err := testinfra.Terminate(d.Cmd.Process); err != nil {
 		t.Fatalf("sending SIGTERM: %v", err)
 	}
-	err, ok := d.waitForExit(shortWait)
+	err, ok := d.WaitForExit(testinfra.ShortWait)
 	if !ok {
 		t.Fatalf("daemon did not exit after SIGTERM")
 	}
 	if err != nil {
-		t.Fatalf("daemon exited unsuccessfully after SIGTERM: %v (stderr=%s)", err, d.stderr.String())
+		t.Fatalf("daemon exited unsuccessfully after SIGTERM: %v (stderr=%s)", err, d.Stderr())
 	}
 	assertIdleConnectionClosed(t, idle)
-	assertPIDGone(t, d.childPID)
+	testinfra.AssertPIDGone(t, childPID)
 	assertPathGone(t, socket)
 }
 
 func TestDuplicateLiveSocketStartupCannotStealOwnership(t *testing.T) {
 	requireLifecycleSupport(t)
-	dir := t.TempDir()
-	socket := filepath.Join(dir, "control.sock")
-	first := startDaemon(t, socket)
+	socket := filepath.Join(t.TempDir(), "control.sock")
+	first, _ := startDaemon(t, socket)
 	originalInfo, err := os.Lstat(socket)
 	if err != nil {
 		t.Fatalf("stat original socket: %v", err)
 	}
 
 	second := newDaemon(t, socket)
-	if err := waitForFile(second, second.pidFile, shortWait); err != nil {
-		t.Fatalf("waiting for duplicate tsgo PID: %v (stderr=%s)", err, second.stderr.String())
-	}
-	second.childPID = readPID(t, second.pidFile)
-	exitErr, ok := second.waitForExit(shortWait)
+	secondPID := second.WaitForPID(t)
+	exitErr, ok := second.WaitForExit(testinfra.ShortWait)
 	if !ok {
 		t.Fatalf("duplicate daemon did not exit promptly")
 	}
 	if exitErr == nil {
 		t.Fatalf("duplicate daemon exited successfully")
 	}
-	stderr := second.stderr.String()
+	stderr := second.Stderr()
 	if !strings.Contains(stderr, socket) || !strings.Contains(stderr, "already") {
 		t.Fatalf("duplicate startup error did not identify socket ownership: %s", stderr)
 	}
-	assertPIDGone(t, second.childPID)
+	testinfra.AssertPIDGone(t, secondPID)
 
 	info, err := os.Lstat(socket)
 	if err != nil || !os.SameFile(originalInfo, info) {
@@ -426,8 +214,8 @@ func TestDuplicateLiveSocketStartupCannotStealOwnership(t *testing.T) {
 	if got := controlCommand(t, socket, "not-a-command"); got != "err unknown\n" {
 		t.Fatalf("original unknown response = %q", got)
 	}
-	if _, ok := first.waitForExit(50 * time.Millisecond); ok {
-		t.Fatalf("original daemon exited while duplicate started: %v", first.exitError())
+	if _, ok := first.WaitForExit(50 * time.Millisecond); ok {
+		t.Fatalf("original daemon exited while duplicate started: %v", first.ExitError())
 	}
 	shutdownViaStdin(t, first)
 	assertPathGone(t, socket)
@@ -435,9 +223,8 @@ func TestDuplicateLiveSocketStartupCannotStealOwnership(t *testing.T) {
 
 func TestCleanupCannotRemoveReplacementSocket(t *testing.T) {
 	requireLifecycleSupport(t)
-	dir := t.TempDir()
-	socket := filepath.Join(dir, "control.sock")
-	d := startDaemon(t, socket)
+	socket := filepath.Join(t.TempDir(), "control.sock")
+	d, _ := startDaemon(t, socket)
 	if err := os.Remove(socket); err != nil {
 		t.Fatalf("unlinking daemon socket: %v", err)
 	}
@@ -465,7 +252,7 @@ func TestCleanupCannotRemoveReplacementSocket(t *testing.T) {
 	if err != nil || !os.SameFile(replacementInfo, info) {
 		t.Fatalf("daemon cleanup removed or changed replacement socket: %v", err)
 	}
-	conn, err := net.DialTimeout("unix", socket, shortWait)
+	conn, err := net.DialTimeout("unix", socket, testinfra.ShortWait)
 	if err != nil {
 		t.Fatalf("dialing replacement socket: %v", err)
 	}
@@ -476,38 +263,20 @@ func TestCleanupCannotRemoveReplacementSocket(t *testing.T) {
 			t.Fatalf("replacement listener did not receive connection")
 		}
 		_ = acceptedConn.Close()
-	case <-time.After(shortWait):
+	case <-time.After(testinfra.ShortWait):
 		t.Fatalf("replacement listener did not receive connection")
-	}
-}
-
-func createStaleSocket(t *testing.T, path string) {
-	t.Helper()
-	fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
-	if err != nil {
-		t.Fatalf("creating stale socket: %v", err)
-	}
-	addr := &syscall.SockaddrUnix{Name: path}
-	if err := syscall.Bind(fd, addr); err != nil {
-		_ = syscall.Close(fd)
-		t.Fatalf("binding stale socket: %v", err)
-	}
-	// A raw Unix socket leaves its pathname behind when its descriptor closes.
-	if err := syscall.Close(fd); err != nil {
-		t.Fatalf("closing stale socket: %v", err)
 	}
 }
 
 func TestStaleSocketIsReclaimedSafely(t *testing.T) {
 	requireLifecycleSupport(t)
-	dir := t.TempDir()
-	socket := filepath.Join(dir, "control.sock")
+	socket := filepath.Join(t.TempDir(), "control.sock")
 	createStaleSocket(t, socket)
 	if _, err := os.Lstat(socket); err != nil {
 		t.Fatalf("stale socket pathname was unexpectedly removed: %v", err)
 	}
 
-	d := startDaemon(t, socket)
+	d, _ := startDaemon(t, socket)
 	if got := controlCommand(t, socket, "sync file.ts"); got != "ok generation=1\n" {
 		t.Fatalf("sync response = %q", got)
 	}
@@ -575,26 +344,22 @@ func TestNonSocketPathsAreNeverTreatedAsStale(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			socket := filepath.Join(dir, "control.sock")
+			socket := filepath.Join(t.TempDir(), "control.sock")
 			verify := tc.make(t, socket)
 			d := newDaemon(t, socket)
-			if err := waitForFile(d, d.pidFile, shortWait); err != nil {
-				t.Fatalf("waiting for tsgo PID: %v (stderr=%s)", err, d.stderr.String())
-			}
-			d.childPID = readPID(t, d.pidFile)
-			exitErr, ok := d.waitForExit(shortWait)
+			childPID := d.WaitForPID(t)
+			exitErr, ok := d.WaitForExit(testinfra.ShortWait)
 			if !ok {
 				t.Fatalf("daemon did not reject non-socket path promptly")
 			}
 			if exitErr == nil {
 				t.Fatalf("daemon accepted non-socket path")
 			}
-			if !strings.Contains(d.stderr.String(), socket) || !strings.Contains(d.stderr.String(), "not a unix socket") {
-				t.Fatalf("startup error was not clear: %s", d.stderr.String())
+			if !strings.Contains(d.Stderr(), socket) || !strings.Contains(d.Stderr(), "not a unix socket") {
+				t.Fatalf("startup error was not clear: %s", d.Stderr())
 			}
 			verify(t)
-			assertPIDGone(t, d.childPID)
+			testinfra.AssertPIDGone(t, childPID)
 		})
 	}
 }

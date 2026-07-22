@@ -11,7 +11,7 @@ are its properties, where is it used") by graph lookup instead of expensive text
 passthrough tools (`find_definition` / `find_references` / `get_outline`) over a `tsgo --lsp`
 provider, deterministic daemon/control-socket lifecycle, JSONL telemetry, WSL↔Windows path
 handling, and a Tier A retrieval-correctness gate that drives the real daemon over MCP. 116 tests
-across 9 packages. **Phase 1 (the staleness barrier) is next.**
+across 10 packages. **Phase 1 (the staleness barrier) is next.**
 
 Docs:
 - [`ARCHITECTURE.md`](./ARCHITECTURE.md) — **visual architecture** (Mermaid diagrams): components, request flow, the staleness barrier, package graph, phase roadmap.
