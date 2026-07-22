@@ -2,6 +2,7 @@
 package testinfra
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -241,6 +242,42 @@ func (d *Daemon) WaitForSocket(path string, timeout time.Duration) error {
 		}
 		return false, nil
 	})
+}
+
+// AcceptedIdleConnection proves the daemon accepted this exact client before
+// returning it for shutdown assertions.
+func AcceptedIdleConnection(t *testing.T, socket string) net.Conn {
+	t.Helper()
+	conn, err := net.DialTimeout("unix", socket, ShortWait)
+	if err != nil {
+		t.Fatalf("connecting idle control client: %v", err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(ShortWait))
+	if _, err := fmt.Fprintln(conn, "unknown command"); err != nil {
+		_ = conn.Close()
+		t.Fatalf("proving idle control client acceptance: %v", err)
+	}
+	response, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		_ = conn.Close()
+		t.Fatalf("reading idle control response: %v", err)
+	}
+	if response != "err unknown\n" {
+		_ = conn.Close()
+		t.Fatalf("idle control response = %q", response)
+	}
+	return conn
+}
+
+// AssertConnectionClosed accepts orderly EOF and platform-specific reset errors.
+func AssertConnectionClosed(t *testing.T, conn net.Conn) {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(ShortWait))
+	var one [1]byte
+	n, err := conn.Read(one[:])
+	if n != 0 || (!errors.Is(err, io.EOF) && !IsClosedConnError(err)) {
+		t.Errorf("idle control connection was not closed: n=%d err=%v", n, err)
+	}
 }
 
 // Poll evaluates condition until it succeeds or timeout elapses.

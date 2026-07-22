@@ -63,11 +63,12 @@ flowchart TB
 the blocking barrier logic lands in Phase 1). The materialized graph index (PageRank repo-map,
 blast-radius) is deliberately **not** here yet — it enters at Phase 2.
 
-**Control-socket lifecycle:** each daemon holds an advisory lock on a persistent companion lock
-file for the listener lifetime. Existing regular files are rejected; existing Unix sockets are
-probed and only confirmed-stale sockets are replaced. Shutdown closes the listener first, marks
-shutdown under the connection mutex, closes every accepted connection (including idle clients),
-and waits for handlers before removing the socket only if its inode is still the one this daemon
+**Control-socket lifecycle:** each daemon holds an advisory lock in a private per-user runtime
+directory for the listener lifetime. Socket directories must be user-owned and non-writable by
+other users; listeners publish with mode `0600`, authorize peer credentials, and replace only the
+exact inode confirmed stale without overwriting a concurrent replacement. Shutdown closes the
+listener first, marks shutdown under the connection mutex, closes every accepted connection
+(including idle clients), and waits for handlers before removing only the socket inode this daemon
 bound. The lock file remains in place so ownership release cannot race with path cleanup.
 
 **Cross-cutting principles** (from `PLAN.md`): signatures-not-bodies · symbol-name-path addressing ·
@@ -212,7 +213,7 @@ flowchart LR
 
 **Phase 0 exit criteria — all green:** MCP round-trip works · every call logged (JSONL) · Tier A
 retrieval-correctness green on a pinned TS repo (`eval/tiera`, which drives the *real* daemon over
-MCP). 116 Go tests pass across 10 packages.
+MCP). 120 Go tests pass across 10 packages.
 
 ---
 

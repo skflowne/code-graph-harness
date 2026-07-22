@@ -5,9 +5,7 @@ package lifecycle
 import (
 	"bufio"
 	"bytes"
-	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -100,31 +98,6 @@ func commandOnConn(t *testing.T, conn net.Conn, command string) string {
 	return response
 }
 
-// acceptedIdleConnection proves the daemon accepted this exact client before
-// leaving it idle for the shutdown assertion.
-func acceptedIdleConnection(t *testing.T, socket string) net.Conn {
-	t.Helper()
-	conn, err := net.DialTimeout("unix", socket, testinfra.ShortWait)
-	if err != nil {
-		t.Fatalf("dialing idle control client: %v", err)
-	}
-	if got := commandOnConn(t, conn, "unknown command"); got != "err unknown\n" {
-		_ = conn.Close()
-		t.Fatalf("idle-client acceptance response = %q", got)
-	}
-	return conn
-}
-
-func assertIdleConnectionClosed(t *testing.T, conn net.Conn) {
-	t.Helper()
-	_ = conn.SetReadDeadline(time.Now().Add(testinfra.ShortWait))
-	var one [1]byte
-	n, err := conn.Read(one[:])
-	if n != 0 || (!errors.Is(err, io.EOF) && !testinfra.IsClosedConnError(err)) {
-		t.Errorf("idle control connection was not closed: n=%d err=%v", n, err)
-	}
-}
-
 func shutdownViaStdin(t *testing.T, d *testinfra.Daemon) {
 	t.Helper()
 	if err := d.Stdin.Close(); err != nil {
@@ -149,20 +122,20 @@ func TestMCPStdinDisconnectShutsDownEverything(t *testing.T) {
 	if got := controlCommand(t, socket, "unknown command"); got != "err unknown\n" {
 		t.Fatalf("unknown response = %q", got)
 	}
-	idle := acceptedIdleConnection(t, socket)
+	idle := testinfra.AcceptedIdleConnection(t, socket)
 	defer idle.Close()
 
 	shutdownViaStdin(t, d)
 	testinfra.AssertPIDGone(t, childPID)
 	assertPathGone(t, socket)
-	assertIdleConnectionClosed(t, idle)
+	testinfra.AssertConnectionClosed(t, idle)
 }
 
 func TestSIGTERMWithIdleControlClient(t *testing.T) {
 	requireLifecycleSupport(t)
 	socket := filepath.Join(t.TempDir(), "control.sock")
 	d, childPID := startDaemon(t, socket)
-	idle := acceptedIdleConnection(t, socket)
+	idle := testinfra.AcceptedIdleConnection(t, socket)
 	defer idle.Close()
 
 	if err := testinfra.Terminate(d.Cmd.Process); err != nil {
@@ -175,7 +148,7 @@ func TestSIGTERMWithIdleControlClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("daemon exited unsuccessfully after SIGTERM: %v (stderr=%s)", err, d.Stderr())
 	}
-	assertIdleConnectionClosed(t, idle)
+	testinfra.AssertConnectionClosed(t, idle)
 	testinfra.AssertPIDGone(t, childPID)
 	assertPathGone(t, socket)
 }

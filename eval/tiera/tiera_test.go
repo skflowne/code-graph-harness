@@ -3,13 +3,8 @@
 package tiera
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -87,39 +82,6 @@ func session(t *testing.T) (*mcp.ClientSession, string) {
 func fixtureRoot(t *testing.T) string {
 	t.Helper()
 	return testinfra.FixtureRoot()
-}
-
-func acceptedIdleConnection(t *testing.T, socket string) net.Conn {
-	t.Helper()
-	conn, err := net.DialTimeout("unix", socket, testinfra.ShortWait)
-	if err != nil {
-		t.Fatalf("connecting idle control client: %v", err)
-	}
-	_ = conn.SetDeadline(time.Now().Add(testinfra.ShortWait))
-	if _, err := fmt.Fprintln(conn, "unknown command"); err != nil {
-		_ = conn.Close()
-		t.Fatalf("proving idle control client acceptance: %v", err)
-	}
-	response, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil {
-		_ = conn.Close()
-		t.Fatalf("reading idle control response: %v", err)
-	}
-	if response != "err unknown\n" {
-		_ = conn.Close()
-		t.Fatalf("idle control response = %q", response)
-	}
-	return conn
-}
-
-func assertIdleConnectionClosed(t *testing.T, conn net.Conn) {
-	t.Helper()
-	_ = conn.SetReadDeadline(time.Now().Add(testinfra.ShortWait))
-	var one [1]byte
-	n, err := conn.Read(one[:])
-	if n != 0 || (!errors.Is(err, io.EOF) && !testinfra.IsClosedConnError(err)) {
-		t.Errorf("idle control connection was not closed: n=%d err=%v", n, err)
-	}
 }
 
 // callInto calls a tool and decodes its structured output into out.
@@ -289,7 +251,7 @@ func TestDaemonStdinEOFStopsProvider(t *testing.T) {
 
 func TestDaemonSIGTERMStopsWithIdleControlClient(t *testing.T) {
 	d := startLifecycleDaemon(t)
-	conn := acceptedIdleConnection(t, d.socket)
+	conn := testinfra.AcceptedIdleConnection(t, d.socket)
 	defer conn.Close()
 
 	started := time.Now()
@@ -300,7 +262,7 @@ func TestDaemonSIGTERMStopsWithIdleControlClient(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > testinfra.ShortWait {
 		t.Fatalf("SIGTERM shutdown took too long: %v", elapsed)
 	}
-	assertIdleConnectionClosed(t, conn)
+	testinfra.AssertConnectionClosed(t, conn)
 	testinfra.AssertPIDGone(t, d.pid)
 	_ = d.sess.Close()
 }

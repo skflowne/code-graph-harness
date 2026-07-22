@@ -103,6 +103,94 @@ func TestControlSocket_RejectsPrecreatedRuntimeDirectorySymlink(t *testing.T) {
 	}
 }
 
+func TestControlSocket_RejectsMissingPrivateRuntimeBase(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("XDG_CACHE_HOME", "")
+	t.Setenv("HOME", "")
+
+	if err := ensureControlRuntimeDir(); err == nil {
+		t.Fatal("expected missing private runtime base to fail closed")
+	}
+}
+
+func TestControlSocket_RejectsPublicSocketDirectory(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatalf("chmod socket directory: %v", err)
+	}
+	cs := NewControlSocket(filepath.Join(dir, "control.sock"), &core.GenerationCounter{})
+	if err := cs.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "socket directory") {
+		t.Fatalf("expected unsafe socket directory error, got %v", err)
+	}
+}
+
+func TestInstallStagedSocketRejectsChangedStalePath(t *testing.T) {
+	dir := t.TempDir()
+	publicPath := filepath.Join(dir, "control.sock")
+	stale, err := net.Listen("unix", publicPath)
+	if err != nil {
+		t.Fatalf("listen stale socket: %v", err)
+	}
+	stale.(*net.UnixListener).SetUnlinkOnClose(false)
+	if err := stale.Close(); err != nil {
+		t.Fatalf("close stale socket: %v", err)
+	}
+	staleInfo, err := os.Lstat(publicPath)
+	if err != nil {
+		t.Fatalf("stat stale socket: %v", err)
+	}
+
+	if err := os.Remove(publicPath); err != nil {
+		t.Fatalf("remove stale socket: %v", err)
+	}
+	if err := os.WriteFile(publicPath, []byte("replacement"), 0o600); err != nil {
+		t.Fatalf("write replacement: %v", err)
+	}
+	staged, stagedPath, _, err := listenStaged(publicPath)
+	if err != nil {
+		t.Fatalf("listen staged socket: %v", err)
+	}
+	defer staged.Close()
+	defer os.Remove(stagedPath)
+
+	if err := installStagedSocket(stagedPath, publicPath, staleInfo); err == nil {
+		t.Fatal("install replaced a pathname changed after stale validation")
+	}
+	contents, err := os.ReadFile(publicPath)
+	if err != nil {
+		t.Fatalf("read replacement: %v", err)
+	}
+	if string(contents) != "replacement" {
+		t.Fatalf("replacement changed: %q", contents)
+	}
+}
+
+func TestRestorePathNoReplacePreservesNewerPath(t *testing.T) {
+	dir := t.TempDir()
+	quarantine := filepath.Join(dir, "quarantine")
+	publicPath := filepath.Join(dir, "control.sock")
+	if err := os.WriteFile(quarantine, []byte("older"), 0o600); err != nil {
+		t.Fatalf("write quarantined path: %v", err)
+	}
+	if err := os.WriteFile(publicPath, []byte("newer"), 0o600); err != nil {
+		t.Fatalf("write newer path: %v", err)
+	}
+
+	if err := restorePathNoReplace(quarantine, publicPath); err == nil {
+		t.Fatal("restore overwrote a newer pathname")
+	}
+	contents, err := os.ReadFile(publicPath)
+	if err != nil {
+		t.Fatalf("read newer path: %v", err)
+	}
+	if string(contents) != "newer" {
+		t.Fatalf("newer path changed: %q", contents)
+	}
+	if _, err := os.Lstat(quarantine); err != nil {
+		t.Fatalf("quarantined path was not preserved: %v", err)
+	}
+}
+
 func TestControlSocket_UnauthorizedPeerCannotSync(t *testing.T) {
 	sockPath := filepath.Join(t.TempDir(), "control.sock")
 	gen := &core.GenerationCounter{}

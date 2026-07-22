@@ -26,8 +26,12 @@ func SocketPath(cfg core.Config) string {
 	if cfg.ControlSocket != "" {
 		return cfg.ControlSocket
 	}
+	runtimeDir := controlRuntimeDir()
+	if runtimeDir == "" {
+		return ""
+	}
 	sum := sha256.Sum256([]byte(cfg.ProjectRoot))
-	return filepath.Join(controlRuntimeDir(), fmt.Sprintf("cgraphd-%s.sock", hex.EncodeToString(sum[:])[:12]))
+	return filepath.Join(runtimeDir, fmt.Sprintf("cgraphd-%s.sock", hex.EncodeToString(sum[:])[:12]))
 }
 
 // ControlSocket is the Phase 0 scaffold for the Phase 1 staleness barrier: a
@@ -87,6 +91,9 @@ func (c *ControlSocket) Start(ctx context.Context) error {
 	if err := ensureControlRuntimeDir(); err != nil {
 		return fmt.Errorf("control socket: preparing private runtime directory: %w", err)
 	}
+	if err := validateUserOwnedDir(filepath.Dir(c.path)); err != nil {
+		return fmt.Errorf("control socket: unsafe socket directory %s: %w", filepath.Dir(c.path), err)
+	}
 
 	lockPath := ownershipLockPath(c.path)
 	lockFile, err := openOwnershipLock(lockPath)
@@ -102,7 +109,8 @@ func (c *ControlSocket) Start(ctx context.Context) error {
 	}
 	c.lockFile = lockFile
 
-	if err := c.preparePath(); err != nil {
+	staleInfo, err := c.preparePath()
+	if err != nil {
 		c.releaseLock()
 		return err
 	}
@@ -113,14 +121,14 @@ func (c *ControlSocket) Start(ctx context.Context) error {
 		return fmt.Errorf("control socket: listen %s: %w", c.path, err)
 	}
 	// The staged socket is never accepted until it has restrictive mode and
-	// has atomically replaced the confirmed-stale pathname.
+	// has been published without overwriting a concurrently changed pathname.
 	if err := os.Chmod(stagedPath, 0o600); err != nil {
 		_ = ln.Close()
 		_ = os.Remove(stagedPath)
 		c.releaseLock()
 		return fmt.Errorf("control socket: chmod %s: %w", stagedPath, err)
 	}
-	if err := os.Rename(stagedPath, c.path); err != nil {
+	if err := installStagedSocket(stagedPath, c.path, staleInfo); err != nil {
 		_ = ln.Close()
 		_ = os.Remove(stagedPath)
 		c.releaseLock()
@@ -147,11 +155,14 @@ func controlRuntimeDir() string {
 		// directly beneath the shared temporary directory.
 		return filepath.Join(cache, "cgraphd-runtime")
 	}
-	return filepath.Join(os.TempDir(), fmt.Sprintf("cgraphd-%d", effectiveUserID()))
+	return ""
 }
 
 func ensureControlRuntimeDir() error {
 	dir := controlRuntimeDir()
+	if dir == "" {
+		return errors.New("no private runtime base: set XDG_RUNTIME_DIR or HOME")
+	}
 	if base := os.Getenv("XDG_RUNTIME_DIR"); base != "" && filepath.IsAbs(base) {
 		if err := validatePrivateDir(base); err != nil {
 			return fmt.Errorf("unsafe XDG_RUNTIME_DIR %s: %w", base, err)
@@ -214,29 +225,85 @@ func ownershipLockPath(socketPath string) string {
 }
 
 // preparePath rejects unsafe existing paths and probes socket paths for a live
-// listener. Stale sockets are not unlinked here: Start atomically replaces one
-// with its already-bound, permission-restricted staged listener.
-func (c *ControlSocket) preparePath() error {
+// listener. It returns the stale inode so installation can prove the pathname
+// did not change before publishing the staged listener.
+func (c *ControlSocket) preparePath() (os.FileInfo, error) {
 	info, err := os.Lstat(c.path)
 	if os.IsNotExist(err) {
-		return nil
+		return nil, nil
 	}
 	if err != nil {
-		return fmt.Errorf("control socket: inspecting %s: %w", c.path, err)
+		return nil, fmt.Errorf("control socket: inspecting %s: %w", c.path, err)
 	}
 	if info.Mode()&os.ModeSocket == 0 {
-		return fmt.Errorf("control socket %s already exists and is not a unix socket", c.path)
+		return nil, fmt.Errorf("control socket %s already exists and is not a unix socket", c.path)
 	}
 
 	conn, err := net.DialTimeout("unix", c.path, 250*time.Millisecond)
 	if err == nil {
 		_ = conn.Close()
-		return fmt.Errorf("control socket %s already has a live listener", c.path)
+		return nil, fmt.Errorf("control socket %s already has a live listener", c.path)
 	}
 	if !confirmedStaleSocket(err) {
-		return fmt.Errorf("control socket: probing %s: %w", c.path, err)
+		return nil, fmt.Errorf("control socket: probing %s: %w", c.path, err)
+	}
+	return info, nil
+}
+
+// installStagedSocket only replaces the exact stale inode that preparePath
+// inspected. Linking publishes the staged listener without overwriting a path
+// installed by another process in the meantime.
+func installStagedSocket(stagedPath, publicPath string, staleInfo os.FileInfo) error {
+	if staleInfo != nil {
+		quarantineDir, err := os.MkdirTemp(filepath.Dir(publicPath), ".cg-install-")
+		if err != nil {
+			return err
+		}
+		quarantine := filepath.Join(quarantineDir, "socket")
+		if err := os.Rename(publicPath, quarantine); err != nil {
+			_ = os.Remove(quarantineDir)
+			if !os.IsNotExist(err) {
+				return err
+			}
+		} else {
+			currentInfo, statErr := os.Lstat(quarantine)
+			if statErr != nil || !os.SameFile(currentInfo, staleInfo) {
+				restoreErr := restorePathNoReplace(quarantine, publicPath)
+				if restoreErr == nil {
+					_ = os.Remove(quarantineDir)
+				}
+				if statErr != nil {
+					return fmt.Errorf("checking quarantined stale socket: %w", statErr)
+				}
+				if restoreErr != nil {
+					return fmt.Errorf("socket path changed after stale check; replacement preserved at %s: %w", quarantine, restoreErr)
+				}
+				return errors.New("socket path changed after stale check")
+			}
+			if err := os.Remove(quarantine); err != nil {
+				return err
+			}
+			_ = os.Remove(quarantineDir)
+		}
+	}
+
+	if err := os.Link(stagedPath, publicPath); err != nil {
+		return err
+	}
+	if err := os.Remove(stagedPath); err != nil {
+		_ = os.Remove(publicPath)
+		return err
 	}
 	return nil
+}
+
+// restorePathNoReplace preserves a quarantined path without overwriting a
+// newer occupant of its public name.
+func restorePathNoReplace(quarantine, publicPath string) error {
+	if err := os.Link(quarantine, publicPath); err != nil {
+		return err
+	}
+	return os.Remove(quarantine)
 }
 
 func listenStaged(path string) (net.Listener, string, os.FileInfo, error) {
@@ -334,10 +401,11 @@ func (c *ControlSocket) removeOwnedSocket() {
 		_ = os.Remove(quarantineDir)
 		return
 	}
-	// The public name was replaced after Start. Put that inode back; never
-	// remove it as part of this instance's cleanup.
-	_ = os.Rename(quarantine, c.path)
-	_ = os.Remove(quarantineDir)
+	// The public name was replaced after Start. Restore it only if no newer
+	// pathname appeared while it was quarantined.
+	if err := restorePathNoReplace(quarantine, c.path); err == nil {
+		_ = os.Remove(quarantineDir)
+	}
 }
 
 func (c *ControlSocket) releaseLock() {
