@@ -131,8 +131,7 @@ func waitForFile(t *testing.T, path string) {
 	t.Fatalf("timed out waiting for %s", path)
 }
 
-func waitForCommand(t *testing.T, d *daemonProcess) {
-	t.Helper()
+func (d *daemonProcess) waitForExit(timeout time.Duration) bool {
 	if d.waitDone == nil {
 		d.waitDone = make(chan error, 1)
 		go func() { d.waitDone <- d.cmd.Wait() }()
@@ -140,7 +139,15 @@ func waitForCommand(t *testing.T, d *daemonProcess) {
 	select {
 	case <-d.waitDone:
 		d.waited = true
-	case <-time.After(5 * time.Second):
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+func waitForCommand(t *testing.T, d *daemonProcess) {
+	t.Helper()
+	if !d.waitForExit(5 * time.Second) {
 		t.Fatal("daemon did not exit promptly")
 	}
 }
@@ -172,10 +179,26 @@ func (d *daemonProcess) cleanup(t *testing.T) {
 		return
 	}
 	d.closed = true
-	_ = d.sess.Close()
-	if d.waitDone != nil && !d.waited {
-		<-d.waitDone
-		d.waited = true
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- d.sess.Close() }()
+	select {
+	case <-closeDone:
+	case <-time.After(5 * time.Second):
+		t.Log("MCP session close timed out; forcing daemon termination")
+		if d.cmd.Process != nil {
+			_ = d.cmd.Process.Kill()
+		}
+	}
+
+	if !d.waitForExit(5 * time.Second) {
+		t.Log("daemon did not terminate after session close; forcing daemon termination")
+		if d.cmd.Process != nil {
+			_ = d.cmd.Process.Kill()
+		}
+		if !d.waitForExit(5 * time.Second) {
+			t.Errorf("daemon did not terminate after forced kill")
+		}
 	}
 	assertChildExited(t, d.tsgoPID)
 }
