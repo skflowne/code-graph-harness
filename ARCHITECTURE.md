@@ -166,6 +166,7 @@ flowchart LR
     mcp["internal/mcp"]
     cmd["cmd/cgraphd<br/>(daemon main)"]
     eval["eval/tiera<br/>(Tier A gate)"]
+    lifecycle["eval/lifecycle<br/>(daemon lifecycle gate)"]
 
     lsp --> core
     tel --> core
@@ -179,6 +180,7 @@ flowchart LR
     cmd --> mcp
     cmd --> tools
     eval --> tools
+    lifecycle --> cmd
 
     classDef center fill:#243b53,stroke:#8bd,color:#fff;
     class core center;
@@ -207,7 +209,7 @@ flowchart LR
 
 **Phase 0 exit criteria — all green:** MCP round-trip works · every call logged (JSONL) · Tier A
 retrieval-correctness green on a pinned TS repo (`eval/tiera`, which drives the *real* daemon over
-MCP). 100 Go tests pass across 8 packages.
+MCP). 116 Go tests pass across 9 packages.
 
 ---
 
