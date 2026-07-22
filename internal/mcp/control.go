@@ -103,6 +103,13 @@ func (c *ControlSocket) Start(ctx context.Context) error {
 		c.releaseLock()
 		return fmt.Errorf("control socket: listen %s: %w", c.path, err)
 	}
+	// net.UnixListener.Close normally unlinks its pathname. Disable that
+	// behavior so cleanup can remove the path only while it still names our
+	// listener; otherwise closing an unlinked listener could remove a
+	// replacement socket that another owner installed at the same path.
+	if unixListener, ok := ln.(*net.UnixListener); ok {
+		unixListener.SetUnlinkOnClose(false)
+	}
 	info, err := os.Lstat(c.path)
 	if err != nil {
 		_ = ln.Close()

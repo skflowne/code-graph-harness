@@ -323,6 +323,11 @@ func TestControlSocket_CleanupPreservesReplacementSocket(t *testing.T) {
 	}
 
 	cancel()
+	// Remove the daemon's pathname while its listener remains open, then
+	// install a replacement before Wait runs ownership-aware cleanup.
+	if err := os.Remove(sockPath); err != nil {
+		t.Fatalf("unlink daemon socket: %v", err)
+	}
 	var replacement net.Listener
 	var err error
 	deadline := time.Now().Add(time.Second)
