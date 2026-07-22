@@ -63,6 +63,13 @@ flowchart TB
 the blocking barrier logic lands in Phase 1). The materialized graph index (PageRank repo-map,
 blast-radius) is deliberately **not** here yet — it enters at Phase 2.
 
+**Control-socket lifecycle:** each daemon holds an advisory lock on a persistent companion lock
+file for the listener lifetime. Existing regular files are rejected; existing Unix sockets are
+probed and only confirmed-stale sockets are replaced. Shutdown closes the listener first, marks
+shutdown under the connection mutex, closes every accepted connection (including idle clients),
+and waits for handlers before removing the socket only if its inode is still the one this daemon
+bound. The lock file remains in place so ownership release cannot race with path cleanup.
+
 **Cross-cutting principles** (from `PLAN.md`): signatures-not-bodies · symbol-name-path addressing ·
 cap/paginate every tool · never deny grep · bounded waits everywhere · accept honest null results.
 

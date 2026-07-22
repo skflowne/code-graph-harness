@@ -13,16 +13,22 @@
 package tiera
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/skflowne/code-graph-harness/internal/core"
+	cgmcp "github.com/skflowne/code-graph-harness/internal/mcp"
 	"github.com/skflowne/code-graph-harness/internal/tools"
 )
 
@@ -54,6 +60,124 @@ func fixtureRoot(t *testing.T) string {
 		t.Fatalf("resolving fixture root: %v", err)
 	}
 	return root
+}
+
+type daemonProcess struct {
+	cmd      *exec.Cmd
+	sess     *mcp.ClientSession
+	stderr   *bytes.Buffer
+	tsgoPID  string
+	waitDone chan error
+	waited   bool
+	closed   bool
+}
+
+func makeDaemonCommand(t *testing.T, root, jsonl, pidFile string) (*exec.Cmd, *bytes.Buffer) {
+	t.Helper()
+	realTsgo, err := exec.LookPath("tsgo")
+	if err != nil {
+		t.Skip("tsgo not on PATH; skipping daemon lifecycle coverage")
+	}
+	wrapper := filepath.Join(t.TempDir(), "tsgo-wrapper.sh")
+	script := "#!/bin/sh\necho $$ > \"$CGRAPH_TSGO_PID_FILE\"\nexec \"$CGRAPH_REAL_TSGO\" \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatalf("writing tsgo wrapper: %v", err)
+	}
+	stderr := &bytes.Buffer{}
+	cmd := exec.Command(daemonBin,
+		"--project-root", root,
+		"--jsonl", jsonl,
+		"--graph-mode", "graph",
+		"--session-id", "lifecycle",
+		"--tsgo", wrapper,
+	)
+	cmd.Env = append(os.Environ(),
+		"CGRAPH_REAL_TSGO="+realTsgo,
+		"CGRAPH_TSGO_PID_FILE="+pidFile,
+	)
+	cmd.Stderr = stderr
+	return cmd, stderr
+}
+
+func startLifecycleDaemon(t *testing.T) *daemonProcess {
+	t.Helper()
+	root := fixtureRoot(t)
+	dir := t.TempDir()
+	jsonl := filepath.Join(dir, "telemetry.jsonl")
+	pidFile := filepath.Join(dir, "tsgo.pid")
+	cmd, stderr := makeDaemonCommand(t, root, jsonl, pidFile)
+	client := mcp.NewClient(&mcp.Implementation{Name: "lifecycle", Version: "0.0.1"}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	sess, err := client.Connect(ctx, &mcp.CommandTransport{Command: cmd}, nil)
+	if err != nil {
+		t.Fatalf("connecting to daemon: %v (stderr=%s)", err, stderr.String())
+	}
+	d := &daemonProcess{cmd: cmd, sess: sess, stderr: stderr, tsgoPID: pidFile}
+	t.Cleanup(func() { d.cleanup(t) })
+	waitForFile(t, pidFile)
+	return d
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", path)
+}
+
+func waitForCommand(t *testing.T, d *daemonProcess) {
+	t.Helper()
+	if d.waitDone == nil {
+		d.waitDone = make(chan error, 1)
+		go func() { d.waitDone <- d.cmd.Wait() }()
+	}
+	select {
+	case <-d.waitDone:
+		d.waited = true
+	case <-time.After(5 * time.Second):
+		t.Fatal("daemon did not exit promptly")
+	}
+}
+
+func assertChildExited(t *testing.T, pidFile string) {
+	t.Helper()
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("reading tsgo PID: %v", err)
+	}
+	var pid int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &pid); err != nil {
+		t.Fatalf("invalid tsgo PID %q: %v", data, err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err != nil {
+			if err == syscall.ESRCH {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("tsgo child pid %d did not exit promptly", pid)
+}
+
+func (d *daemonProcess) cleanup(t *testing.T) {
+	if d.closed {
+		return
+	}
+	d.closed = true
+	_ = d.sess.Close()
+	if d.waitDone != nil && !d.waited {
+		<-d.waitDone
+		d.waited = true
+	}
+	assertChildExited(t, d.tsgoPID)
 }
 
 // session spawns the real daemon over MCP and returns a connected client
@@ -236,6 +360,68 @@ func TestTierA(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestDaemonStdinEOFStopsProvider(t *testing.T) {
+	d := startLifecycleDaemon(t)
+	started := time.Now()
+	if err := d.sess.Close(); err != nil {
+		t.Fatalf("closing MCP stdin: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("MCP disconnect took too long: %v", elapsed)
+	}
+	assertChildExited(t, d.tsgoPID)
+	d.closed = true
+}
+
+func TestDaemonSIGTERMStopsWithIdleControlClient(t *testing.T) {
+	d := startLifecycleDaemon(t)
+	sock := cgmcp.SocketPath(core.Config{ProjectRoot: fixtureRoot(t)})
+	conn, err := net.DialTimeout("unix", sock, time.Second)
+	if err != nil {
+		t.Fatalf("connecting idle control client: %v", err)
+	}
+	defer conn.Close()
+
+	started := time.Now()
+	if err := d.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("SIGTERM: %v", err)
+	}
+	waitForCommand(t, d)
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("SIGTERM shutdown took too long: %v", elapsed)
+	}
+	assertChildExited(t, d.tsgoPID)
+	_ = d.sess.Close()
+	d.closed = true
+}
+
+func TestDuplicateDaemonLeavesOriginalFunctional(t *testing.T) {
+	first := startLifecycleDaemon(t)
+	dir := t.TempDir()
+	secondPID := filepath.Join(dir, "tsgo.pid")
+	secondCmd, stderr := makeDaemonCommand(t, fixtureRoot(t), filepath.Join(dir, "telemetry.jsonl"), secondPID)
+	secondClient := mcp.NewClient(&mcp.Implementation{Name: "duplicate", Version: "0.0.1"}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	_, err := secondClient.Connect(ctx, &mcp.CommandTransport{Command: secondCmd}, nil)
+	cancel()
+	if err == nil {
+		t.Fatal("duplicate daemon unexpectedly connected")
+	}
+	if waitErr := secondCmd.Wait(); waitErr == nil {
+		t.Fatal("duplicate daemon unexpectedly exited successfully")
+	}
+	if !strings.Contains(stderr.String(), "already owned") {
+		t.Fatalf("duplicate startup error was not clear: %s", stderr.String())
+	}
+
+	listCtx, listCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer listCancel()
+	result, err := first.sess.ListTools(listCtx, nil)
+	if err != nil || len(result.Tools) != 3 {
+		t.Fatalf("original daemon was disrupted: tools=%d err=%v", len(result.Tools), err)
+	}
 }
 
 func assertFresh(t *testing.T, stale bool) {
