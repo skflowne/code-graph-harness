@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -35,6 +36,8 @@ func run() error {
 		return err
 	}
 
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+
 	// Telemetry: JSONL only. We deliberately do NOT tee OTEL's stdout exporter
 	// here — the MCP protocol owns stdout, and OTEL spans on stdout would
 	// corrupt the JSON-RPC stream. The OTEL sink (telemetry.NewOTEL / FromConfig)
@@ -45,6 +48,7 @@ func run() error {
 	}
 	logger, err := telemetry.NewJSONL(cfg.JSONLPath)
 	if err != nil {
+		cancel()
 		return fmt.Errorf("cgraphd: opening telemetry stream: %w", err)
 	}
 
@@ -52,44 +56,49 @@ func run() error {
 	// the initialize handshake.
 	provider, err := lsp.New(cfg)
 	if err != nil {
+		_ = logger.Close()
+		cancel()
 		return fmt.Errorf("cgraphd: starting language provider: %w", err)
 	}
-
-	defer func() {
-		if err := provider.Close(); err != nil {
-			log.Printf("cgraphd: provider close: %v", err)
-		}
-		if err := logger.Close(); err != nil {
-			log.Printf("cgraphd: logger close: %v", err)
-		}
-	}()
 
 	gen := &core.GenerationCounter{}
 	t := tools.New(provider, gen, logger, cfg)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	sockPath := cgmcp.SocketPath(cfg)
 	control := cgmcp.NewControlSocket(sockPath, gen)
 	if err := control.Start(ctx); err != nil {
+		_ = provider.Close()
+		_ = logger.Close()
+		cancel()
 		return fmt.Errorf("cgraphd: starting control socket: %w", err)
 	}
 	log.Printf("cgraphd: control socket listening on %s", sockPath)
-	defer control.Wait()
 
 	srv := cgmcp.NewServer(t)
 	log.Printf("cgraphd: serving MCP over stdio (project_root=%s session_id=%s graph_mode=%s)",
 		cfg.ProjectRoot, cfg.SessionID, cfg.GraphMode)
 
-	if err := cgmcp.RunStdio(ctx, srv); err != nil {
+	runErr := cgmcp.RunStdio(ctx, srv)
+	wasCanceled := ctx.Err() != nil
+	// RunStdio can return on stdin EOF without cancelling its context. Cancel
+	// explicitly before waiting for the control listener and its connections.
+	cancel()
+	control.Wait()
+	if err := provider.Close(); err != nil {
+		log.Printf("cgraphd: provider close: %v", err)
+	}
+	if err := logger.Close(); err != nil {
+		log.Printf("cgraphd: logger close: %v", err)
+	}
+
+	if runErr != nil {
 		// Context cancellation (SIGINT/SIGTERM) surfaces here as an error from
 		// the underlying transport; treat it as a clean shutdown rather than
 		// a failure.
-		if ctx.Err() != nil {
+		if wasCanceled || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
 			return nil
 		}
-		return fmt.Errorf("cgraphd: mcp server: %w", err)
+		return fmt.Errorf("cgraphd: mcp server: %w", runErr)
 	}
 	return nil
 }
